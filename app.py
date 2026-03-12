@@ -1,98 +1,80 @@
 import streamlit as st
 from datetime import date
+import google.generativeai as genai
 
 # --- CONFIG ---
 st.set_page_config(page_title="PFA Pro", page_icon="⚓", layout="wide")
 
-# --- GLOBAL MEMORY (Session State) ---
+# --- GEMINI AI SETUP (Diagnostic Mode) ---
+if "GEMINI_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_KEY"])
+    
+    try:
+        # Get all models that support generating content
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        if models:
+            # We will use the first one found, but remove the 'models/' prefix if it's there
+            selected_model = models[0].replace('models/', '')
+            model = genai.GenerativeModel(selected_model)
+            
+            # This will show a temporary message so you know which one worked!
+            st.toast(f"Connected to: {selected_model}", icon="✅")
+        else:
+            st.error("No models found for this API key.")
+            model = None
+            
+    except Exception as e:
+        st.error(f"Failed to connect to Google: {e}")
+        model = None
+else:
+    st.error("⚠️ AI Key Not Found! Check .streamlit/secrets.toml")
+    model = None
+
+# --- GLOBAL MEMORY ---
 if 'water' not in st.session_state: st.session_state.water = 0
 if 'food_cals' not in st.session_state: st.session_state.food_cals = 0
 if 'exercise_burn' not in st.session_state: st.session_state.exercise_burn = 0
 
-# --- UI STYLING & HIGH-CONTRAST BUTTONS ---
+# --- UI STYLING ---
 st.markdown("""
     <style>
     .stApp { background-color: #0E1117; color: #FFFFFF; }
-    
-    /* Metrics Styling */
     [data-testid="stMetricValue"] { color: #00a8ff; font-size: 32px; font-weight: bold; }
-    
-    /* BUTTON STYLING - High Contrast Navy */
     div.stButton > button {
-        background-color: #0077b6;
-        color: white !important;
-        border-radius: 5px;
-        border: 1px solid #00b4d8;
-        font-weight: bold;
-        width: 100%;
-        transition: 0.3s;
+        background-color: #0077b6; color: white !important;
+        border-radius: 5px; border: 1px solid #00b4d8; font-weight: bold; width: 100%;
     }
-    
-    div.stButton > button:hover {
-        background-color: #00b4d8;
-        border: 1px solid white;
-        color: #0E1117 !important;
-    }
-
-    /* Tabs Styling */
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #1A1C23;
-        border-radius: 5px 5px 0px 0px;
-        padding: 10px 20px;
-        color: white;
-    }
+    div.stButton > button:hover { background-color: #00b4d8; color: #0E1117 !important; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- SIDEBAR: MISSION COMMAND ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("⚓ PFA Command")
-    st.divider()
-    
-    # PFA COUNTDOWN
-    st.subheader("🗓️ Target Date")
     pfa_date = st.date_input("Scheduled PFA", value=date(2026, 5, 15))
     days_left = (pfa_date - date.today()).days
+    st.metric("Days to Mission", f"{days_left}")
     
-    if days_left > 0:
-        st.metric("Days to Mission", f"{days_left}")
-    else:
-        st.error("🏁 PFA COMPLETE / OVERDUE")
-
     st.divider()
-
-    # BODY METRICS
-    st.subheader("📋 Body Metrics")
     height = st.number_input("Height (in)", 50, 90, 70)
     waist = st.number_input("Waist (in)", 20.0, 60.0, 35.0, step=0.5)
-    
     wthr = waist / height
     is_passing = wthr <= 0.55
     
     if is_passing:
         st.success(f"BCA: PASSED ({wthr:.2f})")
-        goal = st.selectbox("Objective", ["Maintenance", "Weight Loss", "Performance Bulk"], index=1)
+        goal = st.selectbox("Objective", ["Maintenance", "Weight Loss", "Bulk"], index=1)
     else:
         st.error(f"BCA: ABOVE LIMIT ({wthr:.2f})")
-        st.warning("⚠️ Locked to Weight Loss")
         goal = "Weight Loss"
 
-    # AUTO-TARGETS
-    if goal == "Weight Loss": target_cals = 1800
-    elif goal == "Maintenance": target_cals = 2300
-    else: target_cals = 2800
-
-    st.divider()
-    st.caption("PFA Pro™ | Always Mission Ready")
-    st.caption("© 2026 Dimitry Willadsen")
+    target_cals = 1800 if goal == "Weight Loss" else (2300 if goal == "Maintenance" else 2800)
+    st.caption("PFA Pro™ | © 2026 Dimitry Willadsen")
 
 # --- MAIN DASHBOARD ---
-st.title(f"⚓ Daily Mission: {goal}")
+tab1, tab2, tab3 = st.tabs(["🍴 Nutrition", "🏃 Exercise", "📊 Summary"])
 
-tab1, tab2, tab3 = st.tabs(["🍴 Nutrition", "🏃 Exercise", "📊 Mission Summary"])
-
-# --- TAB 1: NUTRITION & SMART FUEL ---
 with tab1:
     st.header("Smart Mess Deck")
     c1, c2 = st.columns(2)
@@ -100,87 +82,61 @@ with tab1:
     with c1:
         st.subheader("💧 Hydration")
         unit = st.radio("Unit", ["oz", "mL"], horizontal=True)
-        water_input = st.number_input(f"Amount to add ({unit})", min_value=0.0, step=1.0, key="water_in")
+        water_in = st.number_input("Amount", min_value=0.0, key="w_in")
+        if st.button("Log Water"):
+            st.session_state.water += water_in if unit == "oz" else water_in * 0.0338
+        st.info(f"Total: {st.session_state.water:.1f} oz")
+
+with c2:
+        st.subheader("🍳 AI Fuel Log")
+        user_desc = st.text_area("Describe your meal:", placeholder="e.g. 6oz steak, sweet potato, and asparagus")
         
-        if st.button("📥 Log Hydration"):
-            final_oz = water_input if unit == "oz" else water_input * 0.033814
-            st.session_state.water += final_oz
-            st.toast(f"Added {water_input} {unit} to the canteen!")
+        if st.button("🤖 Analyze Meal with Gemini"):
+            if model is None:
+                st.error("AI is not configured. Check .streamlit/secrets.toml")
+            elif user_desc:
+                try:
+                    with st.spinner("Analyzing..."):
+                        # This sends the request to Google
+                        response = model.generate_content(f"How many calories in {user_desc}? Give number only.")
+                        
+                        # This finds the number in the response
+                        import re
+                        numbers = re.findall(r'\d+', response.text)
+                        
+                        if numbers:
+                            est_cals = int(numbers[0])
+                            st.session_state.food_cals += est_cals
+                            st.success(f"Log Updated: +{est_cals} kcal")
+                        else:
+                            st.warning(f"AI responded but no number found: {response.text}")
+                
+                except Exception as e:
+                    # --- THIS IS THE DEBUG SECTION ---
+                    st.error("🚨 Found the problem! See the technical error below:")
+                    st.exception(e) 
+                    # ----------------------------------
+            else:
+                st.warning("Please describe what you ate first.")
 
-        st.info(f"Total: **{st.session_state.water:.1f} oz** ({st.session_state.water * 29.57:.0f} mL)")
-        if st.button("Reset Water"): st.session_state.water = 0
+        st.info(f"Total Fuel: {st.session_state.food_cals} kcal")
 
-    with c2:
-        st.subheader("🍳 Fuel Intake")
-        log_mode = st.radio("Log Method", ["Direct Cal", "Servings/Weight", "AI Describe"], horizontal=True)
-
-        if log_mode == "Direct Cal":
-            food_val = st.number_input("Enter kcal", step=50)
-            if st.button("Log Calories"): st.session_state.food_cals += food_val
-
-        elif log_mode == "Servings/Weight":
-            qty = st.number_input("Quantity", min_value=0.1, step=0.1)
-            unit_type = st.selectbox("Unit", ["Servings", "oz", "grams", "cups"])
-            est_per_unit = st.number_input("Calories per unit", value=100)
-            if st.button("Calculate & Log"): st.session_state.food_cals += (qty * est_per_unit)
-
-        elif log_mode == "AI Describe":
-            user_desc = st.text_input("What did you eat?", placeholder="e.g., 2 slices of pizza and a salad")
-            if st.button("🤖 AI Estimate"):
-                # Keyword logic for v4.0 simulation
-                desc = user_desc.lower()
-                if "pizza" in desc: est = 600
-                elif "chicken" in desc: est = 400
-                elif "salad" in desc: est = 200
-                elif "burger" in desc: est = 800
-                else: est = 500
-                st.session_state.food_cals += est
-                st.success(f"AI Estimated: {est} kcal for '{user_desc}'")
-
-        st.info(f"Total Fuel: **{st.session_state.food_cals} kcal**")
-        if st.button("Reset Daily Fuel"): st.session_state.food_cals = 0
-
-# --- TAB 2: EXERCISE ---
 with tab2:
     st.header("Daily Burn")
-    ex_type = st.selectbox("Activity Type", ["Running (1.5 mi)", "Swimming", "Plank Session", "Custom"])
-    
-    if ex_type == "Running (1.5 mi)": auto_burn = 150
-    elif ex_type == "Swimming": auto_burn = 300
-    else: auto_burn = st.number_input("Custom Burn Calories", step=50)
+    ex_val = st.number_input("Exercise Calories Burned", step=50)
+    if st.button("Log Burn"): 
+        st.session_state.exercise_burn += ex_val
+    st.metric("Total Burned", f"{st.session_state.exercise_burn}")
 
-    if st.button("Log Activity"):
-        st.session_state.exercise_burn += auto_burn
-        st.toast(f"Logged {auto_burn} calories!")
-    
-    st.metric("Total Burned Today", f"{st.session_state.exercise_burn} kcal")
-    if st.button("Reset Exercise"): st.session_state.exercise_burn = 0
-
-# --- TAB 3: SUMMARY ---
 with tab3:
-    st.header("Net Mission Progress")
-    net_cals = st.session_state.food_cals - st.session_state.exercise_burn
-    remaining = target_cals - net_cals
+    st.header("Mission Summary")
+    net = st.session_state.food_cals - st.session_state.exercise_burn
+    remaining = target_cals - net
     
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.metric("Net Calories", f"{net_cals}", delta=f"{remaining} Left", delta_color="normal" if remaining >= 0 else "inverse")
+    st.metric("Net Calories", f"{net}", delta=f"{remaining} Left", delta_color="inverse")
+    st.progress(min(max(net/target_cals, 0.0), 1.0))
     
-    with col_b:
-        progress_val = min(max(net_cals/target_cals, 0.0), 1.0) if target_cals > 0 else 0
-        st.write(f"Fuel Gauge: {int(progress_val * 100)}%")
-        st.progress(progress_val)
-    
-    st.divider()
-    if not is_passing:
-        st.error(f"📉 **Stay Disciplined, Shipmate.** You have {days_left} days to hit your target.")
-    elif goal == "Performance Bulk":
-        st.success("💪 **Get Some!** Build that engine.")
+    if net > target_cals:
+        st.warning("⚠️ You've exceeded your daily target for your objective.")
     else:
-        st.info("⚓ **Steady as she goes.** Mission is on track.")
-
-# --- GLOBAL FOOTER ---
-st.write("")
-st.divider()
-st.caption("All calculations are based on 2026 Navy Physical Readiness Program standards.")
-st.markdown("<p style='font-size: 0.8rem; color: gray;'>PFA Pro™ is a trademark of Dimitry Willadsen. All rights reserved.</p>", unsafe_allow_html=True)
+        st.success("✅ You are currently on track for your mission objective.")

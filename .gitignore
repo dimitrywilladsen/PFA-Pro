@@ -1,0 +1,10 @@
+# Ignore the folder containing the API Key
+.streamlit/
+
+# Ignore the virtual environment
+.venv/
+venv/
+
+# Ignore temporary Python files
+__pycache__/
+*.pyc
