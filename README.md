@@ -14,3 +14,7 @@ PFA Pro is your personal coach for the Navy PFA. Built for the 2026 standards, i
 
 \- \*\*BCA Logic:\*\* Hard-coded Navy Max Weight tables for 2026 readiness.
 
+
+
+© 2026 Dimitry Willadsen. PFA Pro™ is a trademarked project. All Rights Reserved.
+
