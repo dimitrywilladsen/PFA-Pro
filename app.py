@@ -1,142 +1,226 @@
 import streamlit as st
-from datetime import date
-import google.generativeai as genai
+import pandas as pd
+import datetime
+import os
+import re
 
-# --- CONFIG ---
-st.set_page_config(page_title="PFA Pro", page_icon="⚓", layout="wide")
+# --- CALLBACKS ---
+def handle_workout_submission():
+    # These two lines MUST be indented exactly 4 spaces (one Tab)
+    st.session_state["temp_workout_val"] = st.session_state["workout_text_box"]
+    st.session_state["workout_text_box"] = ""
 
-# --- GEMINI AI SETUP (Diagnostic Mode) ---
-if "GEMINI_KEY" in st.secrets:
-    genai.configure(api_key=st.secrets["GEMINI_KEY"])
-    
-    try:
-        # Get all models that support generating content
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        if models:
-            # We will use the first one found, but remove the 'models/' prefix if it's there
-            selected_model = models[0].replace('models/', '')
-            model = genai.GenerativeModel(selected_model)
-            
-            # This will show a temporary message so you know which one worked!
-            st.toast(f"Connected to: {selected_model}", icon="✅")
-        else:
-            st.error("No models found for this API key.")
-            model = None
-            
-    except Exception as e:
-        st.error(f"Failed to connect to Google: {e}")
-        model = None
-else:
-    st.error("⚠️ AI Key Not Found! Check .streamlit/secrets.toml")
-    model = None
+# --- 1. INITIAL SETUP ---
+st.set_page_config(page_title="Navy PFA Pro", layout="wide", page_icon="⚓")
 
-# --- GLOBAL MEMORY ---
-if 'water' not in st.session_state: st.session_state.water = 0
-if 'food_cals' not in st.session_state: st.session_state.food_cals = 0
-if 'exercise_burn' not in st.session_state: st.session_state.exercise_burn = 0
+# Initialize Gemini 2.5 Client
+try:
+    from google import genai
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+except Exception as e:
+    st.error("🔑 Configuration Error: Check your API Key or SDK installation.")
+    st.stop()
 
-# --- UI STYLING ---
-st.markdown("""
-    <style>
-    .stApp { background-color: #0E1117; color: #FFFFFF; }
-    [data-testid="stMetricValue"] { color: #00a8ff; font-size: 32px; font-weight: bold; }
-    div.stButton > button {
-        background-color: #0077b6; color: white !important;
-        border-radius: 5px; border: 1px solid #00b4d8; font-weight: bold; width: 100%;
-    }
-    div.stButton > button:hover { background-color: #00b4d8; color: #0E1117 !important; }
-    </style>
-    """, unsafe_allow_html=True)
+# --- 2. DATA FUNCTIONS ---
+def load_data():
+    if os.path.exists('fitness_log.csv'):
+        df = pd.read_csv('fitness_log.csv')
+        df['date'] = df['date'].astype(str)
+        return df
+    return pd.DataFrame(columns=['date', 'type', 'description', 'calories'])
 
-# --- SIDEBAR ---
+def save_entry(entry_type, desc, cals):
+    new_data = pd.DataFrame([[str(datetime.date.today()), entry_type, desc, cals]], 
+                            columns=['date', 'type', 'description', 'calories'])
+    new_data.to_csv('fitness_log.csv', mode='a', header=not os.path.exists('fitness_log.csv'), index=False)
+
+@st.dialog("Confirm Deletion")
+def confirm_delete_dialog(indices):
+    st.warning(f"⚠️ This will permanently delete {len(indices)} entries. Proceed?")
+    if st.button("🔥 Confirm Bulk Purge", type="primary", use_container_width=True):
+        delete_entries(indices)
+        st.session_state['df_key'] += 1 # Reset table view
+        st.rerun()
+
+def delete_entries(indices):
+    df = pd.read_csv('fitness_logs.csv')
+    df = df.drop(indices)
+    df.to_csv('fitness_logs.csv', index=False)
+
+# Helper to format data for sharing
+def get_shareable_text(row):
+    return f"🚀 Mission Update: {row['type']} - {row['description']} ({row['calories']} kcal) on {row['date']}"
+
+# --- 3. THE "ENGINE" (Calculating variables BEFORE they are used) ---
+# We use the Sidebar to get inputs, but we calculate the variables out here.
 with st.sidebar:
-    st.title("⚓ PFA Command")
-    pfa_date = st.date_input("Scheduled PFA", value=date(2026, 5, 15))
-    days_left = (pfa_date - date.today()).days
-    st.metric("Days to Mission", f"{days_left}")
+    st.header("👤 Sailor Profile")
+    gender = st.radio("Gender", ["Male", "Female"])
+    current_weight = st.number_input("Current Weight (lbs)", value=190)
+    height = st.number_input("Height (inches)", value=70)
+    age = st.number_input("Age", value=25)
+    
+    # CALCULATE BMR IMMEDIATELY
+    w_kg, h_cm = current_weight * 0.453592, height * 2.54
+    bmr = (10 * w_kg) + (6.25 * h_cm) - (5 * age) + (5 if gender == "Male" else -161)
     
     st.divider()
-    height = st.number_input("Height (in)", 50, 90, 70)
-    waist = st.number_input("Waist (in)", 20.0, 60.0, 35.0, step=0.5)
-    wthr = waist / height
-    is_passing = wthr <= 0.55
+    st.header("🎯 BCA Mission")
+    target_weight = st.number_input("BCA Target Weight", value=180)
+    bca_date = st.date_input("BCA Deadline", datetime.date.today() + datetime.timedelta(days=30))
     
-    if is_passing:
-        st.success(f"BCA: PASSED ({wthr:.2f})")
-        goal = st.selectbox("Objective", ["Maintenance", "Weight Loss", "Bulk"], index=1)
+    # CALCULATE DEFICIT
+    days_left = (bca_date - datetime.date.today()).days
+    if days_left > 0:
+        total_to_lose = current_weight - target_weight
+        req_deficit = (total_to_lose * 3500) / days_left
+        lbs_per_week = (total_to_lose / days_left) * 7
     else:
-        st.error(f"BCA: ABOVE LIMIT ({wthr:.2f})")
-        goal = "Weight Loss"
+        req_deficit, lbs_per_week = 0, 0
 
-    target_cals = 1800 if goal == "Weight Loss" else (2300 if goal == "Maintenance" else 2800)
-    st.caption("PFA Pro™ | © 2026 Dimitry Willadsen")
+# Now load today's specific logs
+logs = load_data()
+today_str = str(datetime.date.today())
+today_logs = logs[logs['date'] == today_str]
 
-# --- MAIN DASHBOARD ---
-tab1, tab2, tab3 = st.tabs(["🍴 Nutrition", "🏃 Exercise", "📊 Summary"])
+# --- Initialize Session States for UI Control ---
+if 'df_key' not in st.session_state:
+    st.session_state['df_key'] = 0
 
-with tab1:
-    st.header("Smart Mess Deck")
-    c1, c2 = st.columns(2)
+if 'last_workout' not in st.session_state:
+    st.session_state['last_workout'] = None
+
+# Calculate final totals for the UI
+burned = today_logs[today_logs['type'] == 'Exercise']['calories'].sum()
+eaten = today_logs[today_logs['type'] == 'Food']['calories'].sum()
+
+# THESE ARE THE VARIABLES THAT WERE CAUSING ERRORS - Now they are safe!
+total_burn_today = bmr + burned
+remaining_budget = (total_burn_today - req_deficit) - eaten
+
+# --- 4. MAIN DASHBOARD ---
+tab_ex, tab_meal, tab_hist = st.tabs(["🏃 Exercise", "🍽️ Meals", "📊 History"])
+
+with tab_ex:
+    st.header("Activity Log")
     
-    with c1:
-        st.subheader("💧 Hydration")
-        unit = st.radio("Unit", ["oz", "mL"], horizontal=True)
-        water_in = st.number_input("Amount", min_value=0.0, key="w_in")
-        if st.button("Log Water"):
-            st.session_state.water += water_in if unit == "oz" else water_in * 0.0338
-        st.info(f"Total: {st.session_state.water:.1f} oz")
+    # Notice: Persistent Success Bar
+    if 'last_workout' in st.session_state:
+        st.success(f"✅ **Last Logged:** {st.session_state['last_workout']}")
+    
+    st.metric("Total Active Burn (Today)", f"{int(burned)} kcal")
 
-with c2:
-        st.subheader("🍳 AI Fuel Log")
-        user_desc = st.text_area("Describe your meal:", placeholder="e.g. 6oz steak, sweet potato, and asparagus")
-        
-        if st.button("🤖 Analyze Meal with Gemini"):
-            if model is None:
-                st.error("AI is not configured. Check .streamlit/secrets.toml")
-            elif user_desc:
+    # Input Box
+    workout_desc = st.text_area("Describe workout:", 
+                                placeholder="e.g. Rowed 2k at 2:00 split", 
+                                key="workout_text_box")
+
+    # Analysis Button
+    if st.button("Analyze and Log Workout", on_click=handle_workout_submission):
+        raw_workout = st.session_state.get("temp_workout_val", "")
+        if raw_workout:
+            success = False
+            for attempt in range(3):
                 try:
-                    with st.spinner("Analyzing..."):
-                        # This sends the request to Google
-                        response = model.generate_content(f"How many calories in {user_desc}? Give number only.")
+                    with st.spinner(f"Analyzing... (Attempt {attempt + 1})" if attempt > 0 else "Analyzing..."):
+                        prompt = f"Weight: {current_weight} lbs. Workout: {raw_workout}. Calc calories (MET). Return ONLY integer."
+                        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
                         
-                        # This finds the number in the response
                         import re
-                        numbers = re.findall(r'\d+', response.text)
-                        
-                        if numbers:
-                            est_cals = int(numbers[0])
-                            st.session_state.food_cals += est_cals
-                            st.success(f"Log Updated: +{est_cals} kcal")
-                        else:
-                            st.warning(f"AI responded but no number found: {response.text}")
-                
+                        match = re.search(r'\d+', response.text.replace(',', ''))
+                        if match:
+                            burn_val = int(match.group())
+                            save_entry("Exercise", raw_workout, burn_val)
+                            st.session_state['last_workout'] = f"{raw_workout} — {burn_val} kcal"
+                            success = True
+                            break 
                 except Exception as e:
-                    # --- THIS IS THE DEBUG SECTION ---
-                    st.error("🚨 Found the problem! See the technical error below:")
-                    st.exception(e) 
-                    # ----------------------------------
-            else:
-                st.warning("Please describe what you ate first.")
+                    if "503" in str(e) and attempt < 2:
+                        import time
+                        time.sleep(2)
+                        continue
+                    else:
+                        st.error(f"Analysis Error: {e}")
+                        break
+            if success:
+                st.rerun()
 
-        st.info(f"Total Fuel: {st.session_state.food_cals} kcal")
+with tab_meal:
+    st.header("Daily Calorie Mission")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Burn", f"{int(total_burn_today)}")
+    c2.metric("Total Consumed", f"{int(eaten)}")
+    c3.metric("Dinner Budget", f"{int(remaining_budget)}")
 
-with tab2:
-    st.header("Daily Burn")
-    ex_val = st.number_input("Exercise Calories Burned", step=50)
-    if st.button("Log Burn"): 
-        st.session_state.exercise_burn += ex_val
-    st.metric("Total Burned", f"{st.session_state.exercise_burn}")
+    if st.button("Prescribe Dinner Portions"):
+        with st.spinner("Consulting AI Dietitian..."):
+            prescribe_prompt = f"Sailor has {remaining_budget} kcal left. Suggest portions for Chicken, Rice, Broccoli."
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=prescribe_prompt)
+            st.markdown(response.text)
 
-with tab3:
-    st.header("Mission Summary")
-    net = st.session_state.food_cals - st.session_state.exercise_burn
-    remaining = target_cals - net
+with tab_hist:
+    st.header("Mission Performance History")
     
-    st.metric("Net Calories", f"{net}", delta=f"{remaining} Left", delta_color="inverse")
-    st.progress(min(max(net/target_cals, 0.0), 1.0))
-    
-    if net > target_cals:
-        st.warning("⚠️ You've exceeded your daily target for your objective.")
+    if not logs.empty:
+        logs_display = logs.sort_values(by='date', ascending=False)
+        
+        # 1. Enable MULTI-ROW selection
+        selection = st.dataframe(
+            logs_display,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="multi-row", # Changed from 'single-row'
+            hide_index=False,
+            key=f"history_table_{st.session_state['df_key']}"
+        )
+
+        selected_rows = selection.get("selection", {}).get("rows", [])
+
+        if selected_rows:
+            # Get all selected indices and the actual data rows
+            selected_indices = [logs_display.index[i] for i in selected_rows]
+            selected_data = logs.loc[selected_indices]
+            
+            st.markdown(f"### ⚡ Actions for {len(selected_rows)} selected entries")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                # DELETE: Pass the whole list of indices
+                if st.button("🗑️ Delete All", use_container_width=True, type="primary"):
+                    confirm_delete_dialog(selected_indices)
+            
+            with col2:
+                # COPY/SHARE: Combine all selected rows into one text block
+                combined_text = "\n".join([get_shareable_text(row) for _, row in selected_data.iterrows()])
+                st.write("📋 **Copy All:**")
+                st.code(combined_text, language=None)
+            
+            with col3:
+                # 1. Determine the label based on how many rows are picked
+                num_selected = len(selected_rows)
+                export_label = f"📥 Export ({num_selected}) Entries" if num_selected > 1 else "📥 Export Row"
+                
+                # 2. Create the CSV data for just these rows
+                multi_csv = selected_data.to_csv(index=False).encode('utf-8')
+                
+                # 3. The Download Button with the dynamic label
+                st.download_button(
+                    label=export_label, 
+                    data=multi_csv, 
+                    file_name="mission_selection.csv", 
+                    mime="text/csv", 
+                    use_container_width=True
+                )
+                            
+            with col4:
+                # DESELECT: Still works by incrementing the key
+                if st.button("✖️ Deselect All", use_container_width=True):
+                    st.session_state['df_key'] += 1
+                    st.rerun()
+                    
+        st.divider()
+        full_csv = logs.to_csv(index=False).encode('utf-8')
+        st.download_button("📂 Download Full Mission History", full_csv, "history.csv", "text/csv")
     else:
-        st.success("✅ You are currently on track for your mission objective.")
+        st.info("No logs found.")
