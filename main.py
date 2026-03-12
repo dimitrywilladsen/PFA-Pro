@@ -16,10 +16,7 @@ NAVY_MAX_WEIGHTS = {
 # --- 2. THE TAILORED PLAN GENERATOR ---
 def generate_tailored_plan(target_calories, env, goal_name, weeks):
     """Calculates and prints the exact meal and workout plan."""
-    # Split Calories into 4 Meals
     meal_cals = target_calories / 4
-    
-    # Define Macro Splits (40% Protein, 35% Carbs, 25% Fats)
     p_oz = round((meal_cals * 0.40) / PRO_CAL_OZ, 1)
     c_oz = round((meal_cals * 0.35) / CARB_CAL_OZ, 1)
     f_oz = round((meal_cals * 0.25) / FAT_CAL_OZ, 1)
@@ -53,7 +50,7 @@ def generate_tailored_plan(target_calories, env, goal_name, weeks):
         print("- MAINTENANCE: 30 min Mixed Activity (Run/Swim/Lift) 4x per week.")
     
     print("- SLEEP: 7.5+ Hours of sleep is mandatory for proper recovery.")
-
+    
     print("="*64)
     print("           STAY DISCIPLINED, SHIPMATE.")
     print("="*64)
@@ -72,7 +69,6 @@ def run_pfa_pro():
     print("      PFA PRO: MISSION READINESS COACH (V1.5)")
     print("="*50)
     
-    # --- 1. MISSION TIMELINE ---
     while True:
         date_str = input("\nEnter the date of your next BCA (MM/DD/YYYY): ")
         try:
@@ -91,7 +87,6 @@ def run_pfa_pro():
         except ValueError:
             print("[!] Invalid format. Please use MM/DD/YYYY.")
 
-    # --- 2. PHYSICAL DATA ---
     gender = input("Gender (Male/Female): ").strip().lower()
     while gender not in ["male", "female"]:
         gender = input("[!] Enter 'male' or 'female': ").strip().lower()
@@ -101,7 +96,6 @@ def run_pfa_pro():
     weight_lbs = get_valid_input("Current Weight (lbs): ", 90, 500)
     max_weight = NAVY_MAX_WEIGHTS.get(height_in, 191)
 
-    # --- 3. BCA ANALYSIS ---
     passed_bca = weight_lbs <= max_weight
     if not passed_bca:
         print(f"\n[!] Weight ({weight_lbs} lbs) is above Navy Max ({max_weight} lbs).")
@@ -109,23 +103,17 @@ def run_pfa_pro():
         whtr = waist_in / height_in
         passed_bca = whtr < 0.55
 
-    # --- 4. CALORIE CALCULATIONS ---
     weight_kg = weight_lbs * 0.453592
     height_cm = height_in * 2.54
     bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * age) + (5 if gender == "male" else -161)
     tdee = bmr * 1.3 
 
-    # --- 5. GOAL & ENVIRONMENT SELECTION ---
     if not passed_bca:
         target_calories = tdee - 500
         goal_name = "Weight Loss (BCA Prep)"
     else:
-        print(f"\nBCA STATUS: PASS")
-        print("-" * 30)
-        print("What is your current performance goal?")
-        print("1. Lose (Cut for definition)")
-        print("2. Maintain (Stay the course)")
-        print("3. Gain (Bulk for strength)")
+        print(f"\nBCA STATUS: PASS\n" + "-"*30)
+        print("1. Lose (Cut)\n2. Maintain\n3. Gain (Bulk)")
         goal_choice = input("Select (1/2/3): ")
         
         if goal_choice == "1":
@@ -138,12 +126,9 @@ def run_pfa_pro():
             target_calories = tdee
             goal_name = "Maintenance"
 
-    print("\n[ENVIRONMENT CHECK]")
-    print("1. Barracks (Galley Dining)")
-    print("2. Off-Base (Personal Kitchen/Meal Prep)")
+    print("\n[ENVIRONMENT]\n1. Barracks\n2. Off-Base")
     env_choice = input("Select (1/2): ")
 
-    # --- 6. EXECUTE PLAN ---
     generate_tailored_plan(target_calories, env_choice, goal_name, weeks_until)
 
 if __name__ == "__main__":
@@ -154,4 +139,4 @@ if __name__ == "__main__":
                 print("Secure the watch. Goodbye.")
                 break
     except KeyboardInterrupt:
-        print("\n\n[!] Program closed. Stay ready.")
+        print("\n\n[!] Program closed.")
