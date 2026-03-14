@@ -417,7 +417,7 @@ yesterday_str = str(yesterday_date)
 if "passive_checked" not in st.session_state:
     has_yesterday_passive = not logs[(logs['date'] == yesterday_str) & (logs['type'] == 'Passive')].empty
     if not has_yesterday_passive and not logs.empty:
-        save_entry("Passive", "Daily Resting Calories (BMR)", int(bmr), target_date=yesterday_date)
+        save_entry("Passive", "Daily Resting Calories (BMR)", int(bmr), date_obj=yesterday_date)
         st.session_state["passive_checked"] = True
         st.rerun()
     st.session_state["passive_checked"] = True
