@@ -17,6 +17,7 @@
 --------------------------------
 
 **💍 Oura API Compliance & Legal**
+
 📄 Privacy Policy & Data Usage
 This application (PFA-Pro) is a personal development project.
 
