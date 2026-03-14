@@ -14,7 +14,9 @@
 * **Meal Prep Measurements:** Converts performance goals into actionable food targets to ensure you are fueled for the PRT.
 * **Recovery Tracking:** Integrated monitoring to ensure sleep and mobility support your training volume.
 
-* 💍 Oura API Compliance & Legal
+--------------------------------
+
+**💍 Oura API Compliance & Legal**
 📄 Privacy Policy & Data Usage
 This application (PFA-Pro) is a personal development project.
 
