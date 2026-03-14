@@ -4,20 +4,108 @@ import datetime
 import os
 import re
 import json
+from rapidfuzz import process, utils
+
+# --- THE MASTER SYNC LOGIC ---
+def sync_mission_deadline():
+    # This force-updates the master variable
+    st.session_state.mission_deadline = st.session_state.master_date_input
+    # No st.rerun() here, it's handled by the widget's nature
+
+# Initialize the state if it doesn't exist
+if "mission_deadline" not in st.session_state:
+    st.session_state.mission_deadline = datetime.date.today()
+
+# --- 1. CONSTANTS (Add these for the Exercise Tab) ---
+standard_facilities = [
+    "Treadmill", "Elliptical", "Rowing Machine", "Stationary Bike",
+    "Free Weights", "Squat Rack", "Cable Machine", "Pull-up Bar", 
+    "Dip Station", "Kettlebells", "Medicine Balls", "Resistance Bands", 
+    "Jump Rope", "Box", "Swimming Pool", "Track", "Sandbags", "TRX"
+]
+
+# --- 2. GLOBAL STATE INITIALIZATION ---
+if "bmr" not in st.session_state:
+    st.session_state["bmr"] = 2000.0  
+    st.session_state["setup_complete"] = False
+    st.session_state["gender"] = "Male"
+    st.session_state["age"] = 25
+    st.session_state["height"] = 70.0
+    st.session_state["current_weight"] = 190.0
+    st.session_state["mission_lockdown"] = False
+
+if "req_deficit" not in st.session_state:
+    st.session_state["req_deficit"] = 500.0
+if "burned_exercise" not in st.session_state:
+    st.session_state["burned_exercise"] = 0.0
+if "eaten" not in st.session_state:
+    st.session_state["eaten"] = 0.0
+
+# Add Gym Profiles to prevent the Equipment error
+if "gym_profiles" not in st.session_state:
+    st.session_state["gym_profiles"] = {
+        "Standard Gym": ["Free Weights", "Treadmill", "Pull-up Bar"]
+    }
+
+# --- 3. MAP TO LOCAL VARIABLES ---
+# This ensures lines like 219 (bmr + exercise) work on every rerun
+bmr = st.session_state["bmr"]
+req_deficit = st.session_state["req_deficit"]
+burned_exercise = st.session_state["burned_exercise"]
+eaten = st.session_state["eaten"]
 
 # --- GLOBAL CONFIGURATION ---
 MODEL_ID = "gemini-2.5-flash"
+DB_FILE = "gym_locker.json" 
 
-# --- CALLBACKS ---
-def handle_workout_submission():
-    st.session_state["temp_workout_val"] = st.session_state["workout_text_box"]
-    st.session_state["workout_text_box"] = ""
+# --- PERSISTENCE LOGIC ---
+def save_gyms(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f)
 
-def handle_meal_submission():
-    st.session_state["temp_meal_val"] = st.session_state["meal_text_box"]
-    st.session_state["meal_text_box"] = ""
+def load_gyms():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
 
-# --- 1. INITIAL SETUP ---
+STRATEGY_FILE = "mission_strategy.json"
+
+def save_strategy(strategy_text, target_desc, start_date):
+    data = {
+        "plan": strategy_text,
+        "target": target_desc,
+        "generated_on": str(start_date)
+    }
+    with open(STRATEGY_FILE, "w") as f:
+        json.dump(data, f)
+
+def load_strategy():
+    if os.path.exists(STRATEGY_FILE):
+        try:
+            with open(STRATEGY_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
+
+# --- INITIALIZE STRATEGY IN SESSION STATE ---
+# Add this right after your gym_profiles initialization
+if "long_term_plan" not in st.session_state:
+    saved_strat = load_strategy()
+    if saved_strat:
+        st.session_state["long_term_plan"] = saved_strat["plan"]
+        st.session_state["perf_target"] = saved_strat["target"]
+        st.session_state["strategy_generated_on"] = datetime.datetime.strptime(saved_strat["generated_on"], '%Y-%m-%d').date()
+
+if "account_created" not in st.session_state:
+    # Defaults to 30 days ago if new, or you can set a specific date
+    st.session_state.account_created = datetime.date.today() - datetime.timedelta(days=30)
+
+# --- INITIAL SETUP ---
 st.set_page_config(page_title="Navy PFA Pro", layout="wide", page_icon="⚓")
 
 # Initialize Gemini Client
@@ -28,7 +116,60 @@ except Exception as e:
     st.error("🔑 Configuration Error: Check your API Key in Streamlit Secrets.")
     st.stop()
 
+# Initialize/Load Gym Profiles
+if "gym_profiles" not in st.session_state:
+    saved_data = load_gyms()
+    if saved_data:
+        st.session_state["gym_profiles"] = saved_data
+    else:
+        st.session_state["gym_profiles"] = {
+            "🏠 Home Gym": ["Bodyweight/GRIT", "Dumbbells", "Pull-up Bar"],
+            "⚓ Ship Gym (Afloat)": ["Bodyweight/GRIT", "Kettlebells", "Pull-up Bar"],
+            "🏋️ Base Gym (Main)": ["Barbells & Bumper Plates", "Concept2 Rower", "Stairmaster"]
+        }
+
+# --- DATA FUNCTIONS ---
+
 # --- 2. DATA FUNCTIONS ---
+def get_navy_tier(score):
+    """Maps 0-100 score to official Navy Tiers."""
+    if score >= 90:
+        if score >= 95: return "Outstanding (High)", "#00E5FF"
+        if score >= 92: return "Outstanding (Medium)", "#00B8D4"
+        return "Outstanding (Low)", "#0097A7"
+    elif score >= 75:
+        if score >= 85: return "Excellent (High)", "#00C853"
+        if score >= 80: return "Excellent (Medium)", "#2E7D32"
+        return "Excellent (Low)", "#388E3C"
+    elif score >= 60:
+        if score >= 70: return "Good (High)", "#FFAB00"
+        if score >= 65: return "Good (Medium)", "#FF8F00"
+        return "Good (Low)", "#EF6C00"
+    elif score >= 45:
+        return "Satisfactory", "#D32F2F"
+    else:
+        return "Probationary/Fail", "#757575"
+
+def calculate_score(val, event_type, age, gender):
+    """Calculates point values for PRT events."""
+    if event_type == "Pushups":
+        ref = 60 if gender == "Male" else 35
+        return min(100, int((val / ref) * 80))
+    elif event_type == "Plank":
+        return min(100, int((val / 180) * 90))
+    elif event_type == "1.5 Mile Run":
+        ref_time = 630 if gender == "Male" else 750
+        return min(100, int((ref_time / val) * 95))
+    elif event_type == "Stationary Bike":
+        ref_cals = 200 if gender == "Male" else 160
+        return min(100, int((val / ref_cals) * 90))
+    else:
+        return 75
+
+def update_global_deadline():
+    # Safety check: Only update if the key exists in session state
+    if "master_date_input" in st.session_state:
+        st.session_state.mission_deadline = st.session_state.master_date_input
 def load_data():
     if os.path.exists('fitness_log.csv'):
         try:
@@ -66,6 +207,54 @@ def update_pantry(item, qty, action="add"):
     pantry = pantry[pantry['quantity'] > 0]
     pantry.to_csv('pantry.csv', index=False)
 
+def global_safeguard():
+    """Hard-limits all session data to humanly possible ranges."""
+    # 1. Physical Limits
+    if "age" in st.session_state:
+        st.session_state.age = int(max(17, min(st.session_state.age, 65)))
+    if "height" in st.session_state:
+        st.session_state.height = float(max(48, min(st.session_state.height, 96)))
+    if "current_weight" in st.session_state:
+        st.session_state.current_weight = int(max(90, min(st.session_state.current_weight, 500)))
+
+    # 2. History Integrity
+    if "history" in st.session_state:
+        # Prevent memory bloat (keep last 200 entries)
+        if len(st.session_state.history) > 200:
+            st.session_state.history = st.session_state.history[-200:]
+        
+        # Remove corrupted entries (None values or extreme numbers)
+        st.session_state.history = [
+            e for e in st.session_state.history 
+            if isinstance(e.get("Value"), (int, float)) and 0 <= e["Value"] <= 5000
+        ]
+
+# Execute immediately
+global_safeguard()
+
+def save_entry(category, activity, value, date_obj):
+    # 1. Type Enforcement
+    try:
+        clean_value = float(value)
+    except (ValueError, TypeError):
+        return st.error("Invalid numeric value.")
+
+    # 2. Strategic Clamping (No 100,000 calorie 'typo' entries)
+    safe_value = max(0.0, min(clean_value, 5000.0))
+    
+    # 3. String Sanitization
+    safe_activity = str(activity)[:50].strip() or "Unnamed Entry"
+
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+    st.session_state.history.append({
+        "Date": date_obj,
+        "Category": category,
+        "Activity": safe_activity,
+        "Value": safe_value
+    })
+
 @st.dialog("Confirm Deletion")
 def confirm_delete_dialog(indices):
     st.warning(f"⚠️ This will permanently delete {len(indices)} entries. Proceed?")
@@ -76,106 +265,64 @@ def confirm_delete_dialog(indices):
         st.session_state['df_key'] += 1 
         st.rerun()
 
+# --- SIDEBAR: MISSION COMMAND & MAINTENANCE ---
 with st.sidebar:
-    st.header("🚢 Mission Parameters")
+    st.header("🚢 Mission Control")
     
-    # THE UNIFIED DATE INPUT
-    mission_deadline = st.date_input(
-        "Mission Deadline (BCA/PRT/Goal Date)", 
-        value=datetime.date.today() + datetime.timedelta(days=90),
-        help="The unified target date for your body composition, physical test, and mission goals."
-    )
+    # READ-ONLY DISPLAY
+    deadline = st.session_state.get("mission_deadline", datetime.date.today())
+    days_to_go = (deadline - datetime.date.today()).days
     
-    # SAFETY BRIDGE: Prevents 'bca_date' name errors in other parts of your script
-    bca_date = mission_deadline
+    st.metric(label="Mission Deadline", value=deadline.strftime("%d %b %Y"))
+    st.caption(f"🏁 {days_to_go} Days Remaining")
+    st.divider()    
+    st.divider()
+
+    # 2. DAILY BRIEFING
+    st.subheader("📋 Today's Brief")
     
-    # Calculate days remaining globally
-    days_to_deadline = (mission_deadline - datetime.date.today()).days
-    
-    # Visual countdown for the Sailor
-    if days_to_deadline > 0:
-        st.metric("Time Remaining", f"{days_to_deadline} Days", help="Days until your target goal date.")
+    if "today_workout_type" in st.session_state:
+        st.info(f"**Training:** {st.session_state['today_workout_type']}")
     else:
-        st.error("🏁 DEADLINE REACHED")
+        st.caption("No workout generated for today.")
 
-    st.divider()
-    # ... (Rest of sidebar: Gender, Age, Weight, etc.)
-    st.header("👤 Sailor Profile")
-    gender = st.radio("Gender", ["Male", "Female"])
-    age = st.number_input("Age", value=25)
-    height = st.number_input("Height (inches)", value=70.0, step=0.5)
-    current_weight = st.number_input("Current Weight (lbs)", value=190)
-    
-    st.divider()
-    st.header("📏 2026 BCA Ratio")
-    # The new standard uses umbilicus (bellybutton) measurement
-    waist = st.number_input("Waist Circumference (inches)", value=35.0, step=0.5)
-    
-    # CALCULATE WAIST-TO-HEIGHT RATIO (WHtR)
-    whtr = waist / height if height > 0 else 0
-    st.metric("Waist-to-Height Ratio", f"{whtr:.2f}")
-
-    # 2026 NAVY STANDARD: WHtR must be < 0.55
-    ratio_pass = whtr < 0.55
-    
-    # Step 1: Weight Table (Still used as initial screening)
-    maw = int((height * 4.2) - 105 if gender == "Male" else (height * 3.8) - 110)
-    weight_pass = current_weight <= maw
-
-    # FINAL STATUS: You pass if you meet Weight OR Ratio
-    is_bca_failing = not weight_pass and not ratio_pass
-
-    st.divider()
-    st.header("🎯 Mission Directive")
-    
-    if is_bca_failing:
-        st.error(f"⚠️ BCA FAILURE: Ratio {whtr:.2f} (Limit: 0.55)")
-        st.info("🎯 **Goal Locked:** Weight Loss")
-        mission_goal = "Weight Loss"
-        # Force target to get them back to passing ratio or weight
-        target_waist_goal = height * 0.54
-        default_target = maw
-        upper_limit = maw
-    elif not weight_pass and ratio_pass:
-        st.success(f"✅ RATIO PASS: {whtr:.2f} (Compliant)")
-        mission_goal = st.selectbox("Select Mission Objective", ["Weight Loss", "Maintenance", "Performance Build"])
-        default_target = current_weight
-        upper_limit = 350
+    if "today_meal_plan" in st.session_state:
+        st.success(f"**Nutrition Plan Active**")
     else:
-        st.success(f"✅ TABLE PASS: Under {maw} lbs")
-        mission_goal = st.selectbox("Select Mission Objective", ["Weight Loss", "Maintenance", "Performance Build"])
-        default_target = min(current_weight - 2, maw)
-        upper_limit = 350
+        st.caption("No meal plan generated for today.")
 
-    # ENFORCED TARGET WEIGHT
-    target_weight = st.number_input(
-        "Target Weight (lbs)", 
-        min_value=1, 
-        max_value=upper_limit, 
-        value=int(default_target),
-        help="Capped at MAW only if failing current BCA standards."
-    )
-            
-    # BMR & Deficit Logic
-    w_kg, h_cm = current_weight * 0.453592, height * 2.54
-    bmr = (10 * w_kg) + (6.25 * h_cm) - (5 * age) + (5 if gender == "Male" else -161)
-    days_left = (mission_deadline - datetime.date.today()).days
-    
-    if mission_goal == "Weight Loss":
-        req_deficit = ((current_weight - target_weight) * 3500) / max(days_left, 1) if days_left > 0 else 0
-    elif mission_goal == "Performance Build":
-        req_deficit = -300 
-    else:
-        req_deficit = 0
+    st.caption(f"Target: {st.session_state.get('perf_target', 'Not Set')}")
 
+    # PUSH TO BOTTOM
+    st.write("<br>" * 10, unsafe_allow_html=True) 
     st.divider()
+    
+    # 3. SYSTEM MAINTENANCE (With Confirmation Logic)
     with st.expander("🛠️ System Maintenance"):
-        if st.button("Purge Duplicate Passive Logs"):
-            df = load_data()
-            if not df.empty:
-                others = df[df['type'] != 'Passive']
-                passives = df[df['type'] == 'Passive'].drop_duplicates(subset=['date'], keep='first')
-                pd.concat([others, passives]).to_csv('fitness_log.csv', index=False)
+        st.write("Manage Local Data Files")
+        
+        # Reset Mission Strategy with Safety Confirmation
+        st.markdown("---")
+        confirm_reset = st.checkbox("Confirm Strategy Reset")
+        if st.button("Reset Mission Strategy", use_container_width=True, disabled=not confirm_reset):
+            if os.path.exists("mission_strategy.json"):
+                os.remove("mission_strategy.json")
+                # Clear session state
+                keys_to_clear = ["long_term_plan", "perf_target", "strategy_generated_on"]
+                for key in keys_to_clear:
+                    st.session_state.pop(key, None)
+                st.success("Strategy Deleted.")
+                st.rerun()
+        
+        st.markdown("---")
+        if st.button("Clear Gym Locker", use_container_width=True):
+            if os.path.exists("gym_locker.json"):
+                os.remove("gym_locker.json")
+                st.rerun()
+        
+        if st.button("Purge All Logs", type="primary", use_container_width=True):
+            if os.path.exists("gym_data.csv"):
+                os.remove("gym_data.csv")
                 st.rerun()
 
 # --- 4. THE ENGINE ---
@@ -197,10 +344,10 @@ burned_exercise = abs(today_logs[today_logs['type'] == 'Exercise']['calories'].s
 eaten = today_logs[today_logs['type'] == 'Food']['calories'].sum()
 now = datetime.datetime.now()
 minutes_passed = (now.hour * 60) + now.minute
-passive_burn_to_now = (bmr / 1440) * minutes_passed
+passive_burn_to_now = (st.session_state["bmr"] / 1440) * minutes_passed
 actual_burn_so_far = passive_burn_to_now + burned_exercise
 net_mission_balance = actual_burn_so_far - eaten
-total_expected_burn_today = bmr + burned_exercise
+total_expected_burn_today = st.session_state.get("bmr", 2000.0) + burned_exercise
 remaining_budget = (total_expected_burn_today - req_deficit) - eaten
 
 # SESSION STATE INIT
@@ -212,381 +359,559 @@ if 'meal_cal_fill' not in st.session_state: st.session_state['meal_cal_fill'] = 
 # --- 5. MAIN DASHBOARD ---
 st.title("⚓ Navy PFA Mission Control")
 
-with st.container(border=True):
-    col_stats, col_sitrep = st.columns([2, 3])
-    
-    with col_stats:
-        st.subheader("📊 Vital Stats")
-        s1, s2 = st.columns(2)
-        s1.metric("🕰️ Passive", f"{int(passive_burn_to_now)} kcal")
-        s2.metric("🏃 Active", f"{int(burned_exercise)} kcal")
-        s3, s4 = st.columns(2)
-        s3.metric("🔥 Total", f"{int(actual_burn_so_far)} kcal")
-        delta_label = "Deficit (Good)" if net_mission_balance > 0 else "Surplus"
-        s4.metric("⚖️ Balance", f"{int(net_mission_balance)}", delta=delta_label)
+# --- PLACE THIS AT THE TOP OF YOUR MAIN PAGE (BEFORE TABS) ---
 
-    with col_sitrep:
-        st.subheader("📡 AI Command Sitrep")
-        if st.button("Generate Intelligence Brief", use_container_width=True):
-            with st.spinner("Analyzing Log..."):
-                try:
-                    sitrep_p = f"Goal: {target_weight}lbs. Days to BCA: {days_left}. Stats: {int(actual_burn_so_far)} burned vs {int(eaten)} eaten. Budget: {int(remaining_budget)} kcal. Give a 3-bullet Sitrep using Navy jargon."
-                    res = client.models.generate_content(model="gemini-2.5-flash", contents=sitrep_p)
-                    st.info(res.text)
-                except Exception as e:
-                    st.error(f"Comm Link Down: {e}")
-        else:
-            st.info("Awaiting orders. Click above for a tactical assessment.")
+with st.container(border=True):
+    # Calculation Logic
+    history = st.session_state.get("history", [])
+    
+    # 1. Passive Burn (BMR/RMR)
+    passive_burn = st.session_state.get("bmr", 1506) 
+    
+    # 2. Active Burn (Exercise logs)
+    active_burn = sum(item['Value'] for item in history if item['Category'] == 'Exercise')
+    
+    # 3. Calories Consumed (Nutrition logs)
+    calories_in = sum(item['Value'] for item in history if item['Category'] == 'Nutrition')
+    
+    # 4. Total Expenditure vs Consumption
+    total_out = passive_burn + active_burn
+    net_balance = calories_in - total_out
+
+    # Layout: 4 Columns to fill the horizontal space
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric("🕰️ Passive Burn", f"{passive_burn} kcal")
+    m2.metric("🏃 Active Burn", f"{active_burn} kcal")
+    m3.metric("🍎 Consumed", f"{calories_in} kcal")
+    
+    # Net Balance Logic
+    if net_balance < 0:
+        balance_label = f"Deficit: {abs(net_balance)} kcal"
+        delta_val = "- Deficit"
+        d_color = "normal" # Green in Streamlit
+    else:
+        balance_label = f"Surplus: {net_balance} kcal"
+        delta_val = "+ Surplus"
+        d_color = "inverse" # Red in Streamlit
+
+    m4.metric("⚖️ Net Balance", f"{net_balance} kcal", delta=delta_val, delta_color=d_color)
 
 st.divider()
-total_allowed = total_expected_burn_today - req_deficit
-progress_val = min(max(eaten / max(total_allowed, 1), 0.0), 1.0)
-st.markdown(f"**Daily Fuel Consumption:** {int(eaten)} / {int(total_allowed)} kcal")
-st.progress(progress_val)
-
 # --- 6. TABS ---
-tab_prt, tab_ex, tab_meal, tab_hist = st.tabs(["🏆 PRT", "🏃 Exercise", "🍽️ Meals", "📊 History"])
+tab_prt, tab_perf, tab_nut, tab_analysis = st.tabs(["🏆 PRT", "🏃 Performance", "🍽️ Nutrition", "📊 Analysis"])
 
 with tab_prt:
-    st.header("🏆 PRT Performance Center")
+    st.header("📋 Profile & Performance Assessment")
     
-    # 1. LIVE STANDARDS ENGINE (2026 Navy Standards Approximation)
-    # These thresholds shift based on the Sidebar Age, Gender, and Weight
-    if gender == "Male":
-        # Run Standards (Seconds)
-        run_stnds = {"Outstanding": 578, "Excellent": 652, "Good Low": 773, "Satisfactory": 840}
-        # Pushup Standards (Reps)
-        push_stnds = {"Outstanding": 77, "Excellent": 67, "Good Low": 44, "Satisfactory": 35}
-        # BIKE LOGIC: Weight-dependent calories (Navy formula approximation)
-        # Higher weight = Higher calorie requirement
-        base_bike = (current_weight * 0.75) + (age * 0.5)
-        bike_stnds = {
-            "Outstanding": int(base_bike + 55),
-            "Excellent": int(base_bike + 35),
-            "Good Low": int(base_bike + 12),
-            "Satisfactory": int(base_bike)
-        }
-        # ROW LOGIC (Seconds for 2km)
-        row_stnds = {"Outstanding": 420, "Excellent": 460, "Good Low": 510, "Satisfactory": 555}
+    # --- 1. PHYSICAL PROFILE ---
+    with st.container(border=True):
+        st.subheader("👤 Sailor Physical Profile")
+        col1, col2 = st.columns(2)
+        with col1:
+            gender = st.radio("Gender", ["Male", "Female"], horizontal=True, 
+                             index=0 if st.session_state.get("gender") == "Male" else 1)
+            age = st.number_input("Age", value=int(st.session_state.get("age", 25)), min_value=17, max_value=65)
+        
+        with col2: # Line 415
+            # These lines MUST be indented relative to the 'with' above
+            height = st.number_input("Height (inches)", value=float(st.session_state.get("height", 70.0)), min_value=48.0, max_value=96.0, step=0.1) # Line 417
+            current_weight = st.number_input("Current Weight (lbs)", value=int(st.session_state.get("current_weight", 190)), min_value=80, max_value=500)
+
+    # --- 2. BCA GATEKEEPER ---
+    maw_limit = (height * 4.2) - 105 if gender == "Male" else (height * 3.8) - 110
+    over_weight = current_weight > maw_limit
+    bca_fail = False
+
+    if over_weight:
+        st.warning(f"⚠️ Weight exceeds standard ({int(maw_limit)} lbs). BCA Tape required.")
+        waist = st.number_input("Measured Waist (inches):", value=float(st.session_state.get("waist", 35.0)), min_value=20.0, max_value=height, step=0.1)
+        whtr = waist / height
+        bca_fail = whtr >= 0.55
+        if bca_fail:
+            st.error(f"❌ BCA FAILURE: WtHR is {whtr:.2f}")
+        else:
+            st.info(f"✅ BCA PASS: WtHR is {whtr:.2f}")
     else:
-        # Female Standards
-        run_stnds = {"Outstanding": 700, "Excellent": 780, "Good Low": 930, "Satisfactory": 1020}
-        push_stnds = {"Outstanding": 41, "Excellent": 31, "Good Low": 19, "Satisfactory": 12}
-        base_bike = (current_weight * 0.65) + (age * 0.4)
-        bike_stnds = {
-            "Outstanding": int(base_bike + 45),
-            "Excellent": int(base_bike + 28),
-            "Good Low": int(base_bike + 8),
-            "Satisfactory": int(base_bike)
-        }
-        row_stnds = {"Outstanding": 490, "Excellent": 550, "Good Low": 610, "Satisfactory": 680}
+        st.success(f"✅ Weight within Navy standards.")
 
-    # Plank is age-neutral for most brackets (Seconds)
-    plank_stnds = {"Outstanding": 200, "Excellent": 180, "Good Low": 120, "Satisfactory": 90}
-
-    # 2. INPUT SECTION
-    cardio_type = st.selectbox("Select Cardio Modality", ["1.5 Mile Run", "Stationary Bike (Cals)", "2km Row", "500yd Swim"])
-    
-    col_p1, col_p2, col_p3 = st.columns(3)
-    pushups = col_p1.number_input("Pushups (2 min)", min_value=0, value=push_stnds["Good Low"])
-    plank_time = col_p2.text_input("Plank (min:sec)", value="2:00")
-    
-    if cardio_type == "Stationary Bike (Cals)":
-        cardio_val = col_p3.number_input("Total Calories", min_value=0, value=bike_stnds["Good Low"])
-    else:
-        # Defaults for display
-        def_time = "08:30" if "Row" in cardio_type else "12:30"
-        cardio_val = col_p3.text_input(f"{cardio_type} Time", value=def_time)
-
-    # Time Conversion Helper
-    def time_to_sec(t_str):
-        if isinstance(t_str, (int, float)): return t_str
-        try:
-            if ":" in t_str:
-                m, s = map(int, t_str.split(':'))
-                return (m * 60) + s
-            return int(t_str)
-        except: return 9999 # Treat errors as failures
-
-    p_sec = time_to_sec(plank_time)
-    c_sec = time_to_sec(cardio_val)
-
-    # 3. SCORING LOGIC ENGINE
-    def get_grade(val, stnds, reverse=False):
-        # reverse=True for time (lower numbers are better grades)
-        for grade, threshold in stnds.items():
-            if reverse:
-                if val <= threshold: return grade
-            else:
-                if val >= threshold: return grade
-        return "Fail"
-
-    # Calculate individual grades
-    p_grade = get_grade(pushups, push_stnds)
-    pl_grade = get_grade(p_sec, plank_stnds)
-    
-    if cardio_type == "Stationary Bike (Cals)":
-        c_grade = get_grade(cardio_val, bike_stnds)
-    elif cardio_type == "2km Row":
-        c_grade = get_grade(c_sec, row_stnds, reverse=True)
-    else: # Run or Swim
-        c_grade = get_grade(c_sec, run_stnds, reverse=True)
-
-    # 4. DETERMINING REMEDIAL STATUS
-    # Status is REMEDIAL if any score is 'Satisfactory' or 'Fail' (Below Good Low)
-    grades_list = [p_grade, pl_grade, c_grade]
-    is_remedial = any(g in ["Fail", "Satisfactory"] for g in grades_list)
-    st.session_state["prt_remedial"] = is_remedial
-
-    # 5. DISPLAY RESULTS
+    # --- 3. PERFORMANCE SCORECARD (CLEAN MANUAL ENTRY) ---
     st.divider()
-    if not is_remedial:
-        st.success(f"### ✅ MISSION READY: {c_grade.upper()}")
-    else:
-        st.error("### ⚠️ STATUS: REMEDIAL (Below Good Low)")
-        st.warning("Exercise and Meal plans are now force-locked to PRT Readiness.")
+    st.subheader("🏅 PRT Scorecard")
+    sc1, sc2, sc3 = st.columns(3)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pushups", p_grade, f"Goal: {push_stnds['Good Low']}")
-    c2.metric("Plank", pl_grade, "Goal: 2:00")
-    c3.metric(cardio_type.split()[0], c_grade, f"Target: {bike_stnds['Good Low'] if 'Bike' in cardio_type else 'Pass'}")
+    with sc1:
+        st.markdown("**Upper Body**")
+        pushups = st.number_input("Pushups", value=45, min_value=0, max_value=250, step=1)
+        st.caption("Max reps in 2 mins")
 
-    # 6. REMEDIAL DATE & AI ACTION
-    if is_remedial:
+    with sc2:
+        st.markdown("**Core Stability**")
+        plank_input = st.number_input("Plank (M.SS)", value=2.00, min_value=0.0, max_value=10.0, help="Example: 3.20 is 3m 20s")
+        p_min = int(plank_input)
+        p_sec = round((plank_input - p_min) * 100)
+        plank_total_sec = (p_min * 60) + p_sec
+        st.caption(f"Total: {p_min}m {p_sec}s")
+
+    with sc3:
+        st.markdown("**Cardio Event**")
+        cardio_method = st.selectbox("Event Type", ["1.5 Mile Run", "Stationary Bike", "2000m Row"])
+        
+        # Initialize performance_val immediately
+        performance_val = 0 
+        c_sec = 0
+
+        if cardio_method == "Stationary Bike":
+            # Guardrails: Min 40 cals (low effort) to Max 1000 cals (Elite level 12-min burn)
+            performance_val = st.number_input("Calories", value=150, min_value=40, max_value=1000, step=1)
+            st.caption("Total calories burned")
+            
+        elif cardio_method == "2000m Row":
+            # Guardrails: Min 5.00 (World Class) to Max 20.00 (Failing pace)
+            cardio_input = st.number_input("Time (M.SS)", value=8.30, min_value=5.00, max_value=20.00, step=0.01)
+            c_min = int(cardio_input)
+            c_sec = round((cardio_input - c_min) * 100)
+            performance_val = (c_min * 60) + c_sec
+            st.caption(f"Total: {c_min}m {c_sec}s")
+            
+        else: # 1.5 Mile Run
+            # Guardrails: Min 6.00 (Elite) to Max 25.00 (Walking pace)
+            cardio_input = st.number_input("Time (M.SS)", value=12.30, min_value=6.00, max_value=25.00, step=0.01)
+            c_min = int(cardio_input)
+            c_sec = round((cardio_input - c_min) * 100)
+            performance_val = (c_min * 60) + c_sec
+            st.caption(f"Total: {c_min}m {c_sec}s")
+
+    # --- 4. CALCULATION & TIER DISPLAY ---
+    if p_sec < 60 and (cardio_method == "Stationary Bike" or c_sec < 60):
+        s_push = calculate_score(pushups, "Pushups", age, gender)
+        s_plank = calculate_score(plank_total_sec, "Plank", age, gender)
+        s_cardio = calculate_score(performance_val, cardio_method, age, gender)
+        
+        overall_score = int((s_push + s_plank + s_cardio) / 3)
+        overall_tier, overall_color = get_navy_tier(overall_score)
+
         st.divider()
-        mock_date = st.date_input(
-            "Target Date for Next Mock PRT:",
-            value=datetime.date.today() + datetime.timedelta(days=14)
-        )
-        days_to_mock = (mock_date - datetime.date.today()).days
-        
-        if st.button("🚀 Generate Remedial Readiness Plan", use_container_width=True):
-            with st.spinner("Prioritizing weak events..."):
-                p = f"""
-                DEADLINE: {days_to_mock} days.
-                GRADES: Pushups {p_grade}, Plank {pl_grade}, {cardio_type} {c_grade}.
-                Provide a high-intensity 3-day split to ensure 'Good Low' or higher by the deadline.
-                """
-                res = client.models.generate_content(model="gemini-2.5-flash", contents=p)
-                st.chat_message("coach", avatar="🏃").markdown(res.text)
+        res_col1, res_col2, res_col3 = st.columns(3)
+        res_col1.metric("Pushups", f"{s_push} pts")
+        res_col2.metric("Plank", f"{s_plank} pts")
+        res_col3.metric("Cardio", f"{s_cardio} pts")
 
-with tab_ex:
-    st.header("🏃 Performance Command")
-    
-    # 1. READINESS CHECK
-    is_remedial = st.session_state.get("prt_remedial", False)
-    
-    if is_remedial:
-        st.warning("🚨 **PRT REMEDIAL MODE: ACTIVE**")
+        # The big visual label
+        st.markdown(f"""
+        <div style="background-color:rgba(255,255,255,0.05); padding:20px; border-radius:10px; border-top: 5px solid {overall_color}; text-align:center;">
+            <h2 style="margin:0; color:{overall_color};">{overall_tier}</h2>
+            <p style="margin:0; font-size:1.1em; opacity:0.8;">Composite Readiness Score: <strong>{overall_score}</strong></p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # --- 5. LOCKDOWN VERIFICATION ---
+        # Logic: If BCA fails OR any score is less than 60 (Satisfactory/Fail), Lockdown is True
+        is_failing_or_sat = s_push < 60 or s_plank < 60 or s_cardio < 60
+        
+        if bca_fail:
+            st.error("🚨 MISSION LOCKDOWN: BCA Failure.")
+        elif is_failing_or_sat:
+            st.warning("⚠️ MISSION LOCKDOWN: Performance below 'Good' standard. Recovery Mode Active.")
+
+        # --- 6. SYNC BUTTON ---
+        if st.button("⚖️ Update Mission Profile", type="primary", use_container_width=True):
+            # Apply the lockdown state
+            st.session_state["mission_lockdown"] = bca_fail or is_failing_or_sat
+            
+            # Update BMR for the top HUD
+            w_kg, h_cm = current_weight * 0.453592, height * 2.54
+            st.session_state["bmr"] = (10 * w_kg) + (6.25 * h_cm) - (5 * age) + (5 if gender == "Male" else -161)
+            st.success("✅ Profile Updated. Readiness Synced.")
     else:
-        st.success(f"✅ **CURRENT MISSION:** {mission_goal}")
+        st.error("🚨 Invalid Time Format: Seconds must be .00 to .59")
 
-    # 2. THE AI STRATEGIC PLANNER
-    st.subheader("📋 Strategic Training Plan")
-    with st.expander("🗺️ Configure Gear & Generate Briefing", expanded=True):
+
+with tab_perf:
+    st.header("⚡ Performance Command")
+
+    # --- SECTION 1: STRATEGIC ROLLING PLAN ---
+    with st.container(border=True): # Line 537
+        st.subheader("🎯 Strategic Training Plan") # Line 538 (Indented!)
         
-        # --- CLEAN GEAR SELECTION (GRID STYLE) ---
-        st.write("### 🛠️ Facility Equipment")
-        st.caption("Check all available assets for the AI to utilize in your plan.")
+        col_g1, col_g2 = st.columns([2, 1])
+        # Make sure EVERYTHING inside this block is indented the same amount
+        st.session_state.user_goal = col_g1.text_area(
+            "Primary Training Goal", 
+            value=st.session_state.get("user_goal", "PFA Excellence"),
+            help="Describe your mission, specific weaknesses, and desired outcomes in detail."
+        )
+        
+        # MASTER DATE INPUT: Keeping the temporal guardrail
+        st.date_input(
+            "Mission Deadline", 
+            value=st.session_state.get("mission_deadline", datetime.date.today()),
+            min_value=datetime.date.today(), # Mission cannot be in the past
+            key="master_date_input",
+            on_change=update_global_deadline 
+        )
+        
+        # Local variable for the countdown logic
+        mission_deadline = st.session_state.get("mission_deadline", datetime.date.today())
+        days_rem = (mission_deadline - datetime.date.today()).days
+        
+        st.caption(f"📅 Sidebar Deadline updated to: **{mission_deadline.strftime('%d %b %Y')}**")
+        if days_rem >= 0:
+            st.info(f"⏳ **{days_rem} Days** until mission execution.")
+        else:
+            st.warning("⚠️ **Mission Deadline passed.** Update above to recalibrate.")
 
-        full_gym_list = [
-            "Barbells & Bumper Plates", "Dumbbells", "Kettlebells", 
-            "Stairmaster", "Elliptical", "Treadmill (Incline)",
-            "Stationary Bike", "Concept2 Rower", "SkiErg",
-            "Battling Ropes", "Climbing Ropes", "Medicine Balls", 
-            "Slam Balls", "Sandbags", "Sleds/Prowlers",
-            "Pull-up Bar", "TRX/Suspension Trainers", "Plyo Boxes", 
-            "Swim Pool", "Track/Open Road", "Bodyweight/GRIT"
+        # --- PRECISION READINESS LOCK ---
+        current_tier = st.session_state.get("current_tier", "Good Low") 
+        bca_pass = st.session_state.get("bca_pass", True)
+        
+        lock_tiers = ["Satisfactory High", "Satisfactory Low", "Satisfactory", "Failure"]
+        lockdown = (current_tier in lock_tiers) or (not bca_pass)
+        st.session_state.mission_lockdown = lockdown
+
+        if lockdown:
+            st.error(f"🚨 MISSION LOCKDOWN: {current_tier if bca_pass else 'BCA FAILURE'}.")
+        else:
+            st.success(f"✅ READINESS SECURED: Tier '{current_tier}' meets mission standards.")
+
+        if st.button("🗺️ Generate Master Strategic Plan", use_container_width=True):
+            with st.spinner("Calculating Rolling Horizon Plan..."):
+                plan_p = f"""
+                ROLE: Navy Master Fitness Coordinator.
+                GOAL: {st.session_state.user_goal}. DEADLINE: {days_rem} days.
+                STATUS: {'LOCKDOWN' if lockdown else 'Optimal'}.
+                TASK: Provide 14 days of detailed daily focus/RPE, then a high-level overview for the remaining {max(0, days_rem-14)} days.
+                """
+                plan_res = client.models.generate_content(model=MODEL_ID, contents=plan_p)
+                st.session_state["master_plan"] = plan_res.text
+        
+        if "master_plan" in st.session_state:
+            with st.expander("📖 View Rolling Strategic Plan", expanded=True):
+                st.markdown(st.session_state["master_plan"])
+
+    # --- SECTION 2: DEPLOYMENT ENVIRONMENT (GYM & GEAR) ---
+    with st.container(border=True):
+        st.subheader("🏫 Deployment Environment")
+        
+        standard_gear = [
+            "Bodyweight", "Standard Rack", "1.5-Mile Track", "Dumbbells", "Kettlebells", 
+            "Pull-up Bar", "TRX", "Sandbags", "Rowing Machine", "Air Bike", 
+            "Barbell & Plates", "Medicine Balls", "Jump Rope", "Bench", "Resistance Bands"
         ]
 
-        # Container for organized layout
-        assets = []
-        with st.container(border=True):
-            col1, col2, col3 = st.columns(3)
-            for i, item in enumerate(full_gym_list):
-                if i % 3 == 0:
-                    with col1:
-                        if st.checkbox(item, value=True, key=f"ex_check_{item}"):
-                            assets.append(item)
-                elif i % 3 == 1:
-                    with col2:
-                        if st.checkbox(item, value=True, key=f"ex_check_{item}"):
-                            assets.append(item)
-                else:
-                    with col3:
-                        if st.checkbox(item, value=True, key=f"ex_check_{item}"):
-                            assets.append(item)
-
-        # 3. ADD INDIVIDUAL CUSTOM ITEMS
-        custom_assets = st.text_input(
-            "➕ Add specialized equipment not listed:",
-            placeholder="e.g., Weighted Vest, GHD Machine, Assault Bike, Tires",
-            help="Type extra gear here, separated by commas."
-        )
+        if "gym_profiles" not in st.session_state:
+            st.session_state.gym_profiles = {"Standard Locker": ["Bodyweight", "Standard Rack", "1.5-Mile Track"]}
         
-        # Merge lists for the AI
-        total_assets = assets + [item.strip() for item in custom_assets.split(",") if item.strip()]
-        assets_str = ", ".join(total_assets)
-        
-        st.write("---")
+        gym_list = list(st.session_state.gym_profiles.keys())
+        if "active_gym" not in st.session_state or st.session_state.active_gym not in gym_list:
+             st.session_state.active_gym = gym_list[0]
+             
+        active_gym = st.selectbox("Active Location", gym_list, index=gym_list.index(st.session_state.active_gym))
+        st.session_state.active_gym = active_gym
 
-        # Performance Target
-        perf_goal_desc = st.text_area(
-            "What is your specific performance target?",
-            placeholder="e.g., Increase pushups by 20 and shave 1 minute off my 1.5-mile run.",
-            help="The AI uses this to build your phases and fuel your meal plan."
-        )
-
-        if st.button("🗺️ Generate Long-Term Training Strategy", use_container_width=True):
-            # Calculate days to deadline
-            days_to_deadline = (mission_deadline - datetime.date.today()).days
-            
-            with st.spinner(f"Consulting Tactical Coach for a {days_to_deadline}-day evolution..."):
-                try:
-                    # UPDATED: Dynamic Focus Prompt (2-Week Dive + Long Term Overview)
-                    coach_p = f"""
-                    ROLE: Tactical Strength & Conditioning Coach.
-                    MISSION: {mission_goal if not is_remedial else 'REMEDIAL PRT RECOVERY'}.
-                    TARGET: {perf_goal_desc}.
-                    TIMELINE: {days_to_deadline} days remaining.
-                    ASSETS: {assets_str}.
-
-                    TASK: Provide a periodized plan with this structure:
-                    1. 🛡️ THE 14-DAY DEEP DIVE: Specific daily workouts for the next 2 weeks. 
-                       Incorporate equipment like {assets_str[:50]}...
-                    2. 📈 THE MONTHLY HORIZON: Weekly focus and frequency for days 15-30.
-                    3. 🔭 LONG-TERM STRATEGY: High-level overview of training phases until the deadline.
-                    
-                    TONE: Professional and motivating.
-                    """
-                    
-                    res = client.models.generate_content(model=MODEL_ID, contents=coach_p)
-                    st.chat_message("coach", avatar="🏃").markdown(res.text)
-
-                    # --- BRIDGE TO MEAL TAB ---
-                    st.session_state["current_perf_strategy"] = perf_goal_desc
-                    
-                except Exception as e:
-                    st.error(f"Comm Link lost: {e}")
-
-    st.divider()
-
-    # 4. DAILY ACTIVITY LOGGING
-    st.subheader("📝 Daily Log")
-    workout_desc = st.text_area("Describe today's training:", placeholder="e.g., 20 mins Stairmaster, then 5 rounds of Kettlebell swings.")
-    
-    if st.button("Analyze and Log Workout", use_container_width=True):
-        if workout_desc:
-            with st.spinner("Analyzing performance..."):
-                try:
-                    p = f"Weight: {current_weight}lbs. Workout: {workout_desc}. Calculate kcal burn. Return integer only."
-                    res = client.models.generate_content(model=MODEL_ID, contents=p)
-                    import re
-                    val = int(re.search(r'\d+', res.text).group())
-                    save_entry("Exercise", workout_desc, val)
-                    st.success(f"Logged: {val} kcal burned.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Logging failed: {e}")
-
-with tab_meal:
-    st.header("🍽️ Performance Fueling")
-
-    # 1. INITIALIZE CACHE & RETRIEVE CONTEXT
-    perf_goal = st.session_state.get("current_perf_strategy", "General Health & Maintenance")
-    if "cached_shopping_list" not in st.session_state:
-        st.session_state["cached_shopping_list"] = None
-
-    # 2. STRATEGIC SOURCING PROFILE
-    with st.container(border=True):
-        st.write("### 📍 Logistics & Sourcing")
-        
-        # Manual Zip Code Input - Privacy First
-        zip_code = st.text_input(
-            "Enter Zip Code:", 
-            placeholder="e.g., 32212",
-            max_chars=5,
-            help="The AI uses your zip code to identify the closest Costco, Commissary, or local grocery chains."
-        )
-        
-        shop_prefs = st.multiselect(
-            "Preferred Retailers:",
-            options=["Commissary", "Costco", "Sam's Club", "Walmart", "Target", "Publix/Safeway", "Aldi"],
-            default=["Commissary", "Costco"]
-        )
-
-        pantry_items = st.text_area(
-            "🥫 Pantry Inventory (What's already in the locker?)",
-            placeholder="e.g., White rice, Olive oil, Salt/Pepper, Whey Protein"
-        )
-
-    st.write("---")
-
-    # 3. THE "I'M GOING SHOPPING" ENGINE
-    if st.button("🛒 I'm Going Shopping (14-Day Tactical Plan)", use_container_width=True, type="primary"):
-        if not zip_code or len(zip_code) < 5:
-            st.error("⚠️ Please enter a valid 5-digit Zip Code to optimize your route.")
-        else:
-            with st.spinner(f"Scouting provisioning options near {zip_code}..."):
-                try:
-                    shopping_p = f"""
-                    ROLE: Tactical Logistics & Sports Dietitian.
-                    LOCATION: Zip Code {zip_code}.
-                    TARGET RETAILERS: {', '.join(shop_prefs)}.
-                    TIMELINE: 14-Day Evolution.
-                    PERFORMANCE GOAL: {perf_goal}.
-                    EXISTING PANTRY: {pantry_items if pantry_items else 'None listed'}.
-
-                    TASK:
-                    1. LOCALIZE: Based on zip {zip_code}, identify which of the {', '.join(shop_prefs)} are likely available.
-                    2. STRATEGIZE: Provide a 14-day meal plan overview that matches the performance goal of {perf_goal}.
-                    3. SOURCE: Create a 14-day shopping list. 
-                       - Group items by store (e.g., 'Bulk items to get at Costco', 'Fresh items at the Commissary').
-                       - Do NOT include items already in the pantry.
-                    
-                    FORMAT: Use [ ] checkboxes and bold category headers.
-                    """
-                    res = client.models.generate_content(model=MODEL_ID, contents=shopping_p)
-                    st.session_state["cached_shopping_list"] = res.text
-                except Exception as e:
-                    st.error(f"Logistics Link lost: {e}")
-
-    # 4. DISPLAY SHOPPING LIST & LOGGING
-    if st.session_state["cached_shopping_list"]:
-        with st.expander("📦 View My 14-Day Tactical Shopping Plan", expanded=True):
-            st.markdown(st.session_state["cached_shopping_list"])
-            st.download_button("📲 Save to Phone", st.session_state["cached_shopping_list"], file_name=f"Shopping_List_{zip_code}.txt", use_container_width=True)
-
-    st.divider()
-    
-    # 5. RESTORED NUTRITION LOG (Ensuring it stays at the bottom)
-    st.subheader("📝 Daily Nutrition Log")
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        meal_desc = st.text_input("What did you eat?", placeholder="e.g., 2 Chicken Tacos, Black beans")
-    with col_b:
-        manual_cal = st.number_input("Calories (0 = AI Guess)", min_value=0)
-
-    if st.button("Log Meal Entry", use_container_width=True):
-        if meal_desc:
-            try:
-                p = f"Estimate calories for: {meal_desc}. Return integer only."
-                res = client.models.generate_content(model=MODEL_ID, contents=p)
-                import re
-                match = re.search(r'\d+', res.text)
-                val = int(match.group()) if match else 0
-                save_entry("Food", meal_desc, val)
-                st.success(f"Logged {val} kcal.")
+        with st.expander("🛠️ Modify Gym / Gear Locker"):
+            new_name = st.text_input("New Profile Name")
+            if st.button("➕ Create Profile") and new_name:
+                st.session_state.gym_profiles[new_name] = ["Bodyweight"]
+                st.session_state.active_gym = new_name
                 st.rerun()
-            except Exception as e:
-                st.error(f"Log failed: {e}")
-with tab_hist:
-    st.header("History")
-    if not logs.empty:
-        logs_display = logs.sort_values(by='date', ascending=False)
-        selection = st.dataframe(logs_display, use_container_width=True, on_select="rerun", selection_mode="multi-row", key=f"hist_{st.session_state['df_key']}")
-        rows = selection.get("selection", {}).get("rows", [])
-        if rows:
-            selected_indices = [logs_display.index[i] for i in rows]
-            if st.button("🗑️ Delete Selected"): confirm_delete_dialog(selected_indices)
-    else: st.info("No logs.")
+            
+            st.divider()
+            add_item = st.selectbox("Add Standard Gear:", ["Select..."] + standard_gear)
+            if st.button("📥 Add Standard") and add_item != "Select...":
+                if add_item not in st.session_state.gym_profiles[active_gym]:
+                    st.session_state.gym_profiles[active_gym].append(add_item)
+                    st.rerun()
+
+            st.session_state.gym_profiles[active_gym] = st.multiselect(
+                "Verify Locker Contents:", options=st.session_state.gym_profiles[active_gym],
+                default=st.session_state.gym_profiles[active_gym]
+            )
+
+    # --- SECTION 3: EVOLUTION ENGINE (DAILY WORKOUT) ---
+    with st.container(border=True):
+        st.subheader("🔥 Daily Evolution")
+        evo_choice = st.radio("Daily Protocol:", ["Follow Strategic Plan", "Call an Audible"], horizontal=True)
+        
+        if st.button("🚀 Generate Daily Workout", type="primary", use_container_width=True):
+            with st.spinner("Syncing Environment..."):
+                gear_str = ", ".join(st.session_state.gym_profiles[active_gym])
+                master_context = st.session_state.get("master_plan", "General Readiness")
+                
+                perf_p = f"Navy Tactical Coach. MISSION IN: {days_rem} days. GEAR: {gear_str}. CHOICE: {evo_choice}. STATUS: {'LOCKDOWN' if lockdown else 'Normal'}. TASK: Generate 1 workout."
+                res = client.models.generate_content(model=MODEL_ID, contents=perf_p)
+                st.session_state["daily_evo"] = res.text
+                st.rerun()
+
+        if "daily_evo" in st.session_state:
+            st.markdown(st.session_state["daily_evo"])
+
+   # --- SECTION 4: POST-WORKOUT ANALYSIS & LOGGING ---
+    with st.container(border=True):
+        st.subheader("📊 Performance Analysis")
+        method = st.radio("Analysis:", ["AI Estimate", "Manual Tracker"], horizontal=True)
+        
+        if method == "AI Estimate":
+            workout_desc = st.text_area("Describe the session (movements/intensity):")
+            # Added date picker for AI estimates
+            ai_date = st.date_input("Workout Date", value=datetime.date.today(), 
+                             max_value=datetime.date.today(), key="ai_d")
+            
+            if st.button("🧮 Analyze"):
+                # Ensure MODEL_ID and client are properly configured at the top
+                analysis_res = client.models.generate_content(model=MODEL_ID, contents=f"Estimate burn for: {workout_desc}.")
+                st.info(analysis_res.text)
+                st.caption(f"Suggested for: {ai_date}")
+
+        else:
+            col_l1, col_l2, col_l3 = st.columns([1, 2, 1.5])
+            kcal = col_l1.number_input("Kcal Burned", min_value=0, max_value=5000, step=50)
+            manual_desc = col_l2.text_input("Workout Title", placeholder="e.g., 5k Run", max_chars=100)
+            
+            # This is the single, clean version of the date input
+            manual_date = col_l3.date_input(
+                "Date", 
+                value=datetime.date.today(),
+                min_value=datetime.date(2025, 1, 1),
+                max_value=datetime.date.today(),
+                key="ex_manual_d"
+            )
+            
+            if st.button("📝 Log Work", use_container_width=True):
+                if manual_desc and kcal > 0:
+                    # Assuming save_entry accepts: category, activity, value, date
+                    save_entry("Exercise", manual_desc, kcal, manual_date)
+                    st.success(f"Logged: {manual_desc} for {manual_date}")
+                    st.rerun()
+                else:
+                    st.error("Please provide a title and calorie amount.")
+
+with tab_nut:
+    st.header("🍽️ Nutritional Command & Logistics")
+
+    # --- 1. PERFORMANCE & GOAL SYNC ---
+    # Pulling live data from other tabs for alignment
+    current_goal = st.session_state.get("user_goal", "Standard Performance")
+    workout_today = st.session_state.get("daily_workout", "Rest Day")
+    lockdown = st.session_state.get("mission_lockdown", False)
+
+    # --- 2. PANTRY & GYM LOCKER INVENTORY ---
+    with st.expander("📦 Gym Locker & Pantry Inventory", expanded=False):
+        pantry_df = load_pantry()
+        
+        col_p1, col_p2, col_p3 = st.columns([2, 1, 1])
+        new_item = col_p1.text_input("Add Item", placeholder="e.g., Tuna, Rice", key="p_in")
+        new_qty = col_p2.number_input("Qty", min_value=0, value=1, key="p_qty")
+        if col_p3.button("📥 Update Stock", use_container_width=True):
+            update_pantry(new_item, new_qty, action="add")
+            st.rerun()
+
+        if not pantry_df.empty:
+            st.dataframe(pantry_df, use_container_width=True, hide_index=True)
+            if st.button("🗑️ Purge Empty Stock"):
+                pantry_df = pantry_df[pantry_df['quantity'] > 0]
+                pantry_df.to_csv('pantry.csv', index=False)
+                st.rerun()
+        else:
+            st.info("Pantry is empty. Secure supplies to optimize procurement.")
+
+    st.divider()
+
+    # --- 3. TACTICAL SETTINGS ---
+    col_n1, col_n2 = st.columns(2)
+    with col_n1:
+        dining_env = st.radio("Environment:", ["⚓ Mess Decks", "🏠 Shore / Home"], horizontal=True)
+        meal_freq = st.select_slider(
+            "Meal Frequency:", 
+            options=["1 Meal", "2 Meals", "3 Meals", "4 Meals"], 
+            value="3 Meals"
+        )
+        duration = st.selectbox("Plan Duration:", ["Daily Brief", "14-Day Evolution"])
+
+    with col_n2:
+        zip_code = st.text_input("📍 Zip Code", placeholder="23511", max_chars=5)
+        preferred_stores = st.multiselect(
+            "Target Stores:",
+            ["NEX / Commissary", "Costco", "Sam's Club", "Walmart", "Aldi"],
+            default=["NEX / Commissary"]
+        )
+
+    # --- 4. MISSION EXECUTION (Generation & Restock) ---
+    c_gen, c_restock, c_out = st.columns(3)
+    
+    # ACTION A: Generate the Sync'd Meal Plan
+    if c_gen.button("🍴 Generate Plan", use_container_width=True, type="primary"):
+        with st.spinner("Syncing with Performance Tab..."):
+            stores_str = ", ".join(preferred_stores)
+            nut_p = f"""
+            ROLE: Navy Tactical Dietitian.
+            GOAL: {current_goal}. TODAY'S WORKOUT: {workout_today}.
+            DURATION: {duration}. FREQUENCY: {meal_freq}. ZIP: {zip_code}.
+            ENVIRONMENT: {dining_env}.
+            
+            TASK: Generate a meal plan aligned with {current_goal}. 
+            Adjust macros for {workout_today}. (e.g., Higher carbs for cardio, higher protein for lifting).
+            """
+            res = client.models.generate_content(model=MODEL_ID, contents=nut_p)
+            st.session_state["active_nut_plan"] = res.text
+            st.rerun()
+
+    # ACTION B: Restock & Forecast Popover
+    with c_restock.popover("🛒 Restock & Forecast", use_container_width=True):
+        st.subheader("📋 Logistics Checkpoint")
+        confirm_p = st.checkbox("Pantry is up-to-date")
+        loadout = st.radio("Scope:", ["Match Current Plan", "Full 2-Week Strategic Loadout"])
+        
+        if st.button("🚀 Execute Analysis", type="primary", use_container_width=True):
+            if confirm_p:
+                with st.spinner("Calculating local rates..."):
+                    inventory_str = pantry_df.to_string()
+                    restock_p = f"""
+                    ROLE: Navy Logistics Specialist. 
+                    ZIP: {zip_code}. STORES: {preferred_stores}. SCOPE: {loadout}.
+                    PANTRY: {inventory_str}.
+                    TASK: Provide missing items, categorized by store, and a 2026 COST FORECAST for ZIP {zip_code}.
+                    Include specific store locations.
+                    """
+                    res_r = client.models.generate_content(model=MODEL_ID, contents=restock_p)
+                    st.session_state["restock_list"] = res_r.text
+                    st.rerun()
+
+    # ACTION C: Dining Out Recon
+    with c_out.popover("🍕 Dining Out", use_container_width=True):
+        st.subheader("🎯 Menu Recon")
+        target_res = st.text_input("Restaurant Name", placeholder="e.g., Chipotle")
+        if st.button("🔍 Get Tactical Order", use_container_width=True):
+            recon_p = f"GOAL: {current_goal}. RESTAURANT: {target_res}. Give 2 orders: 1 Performance, 1 Lockdown."
+            res_rec = client.models.generate_content(model=MODEL_ID, contents=recon_p)
+            st.session_state["active_recon"] = res_rec.text
+
+    # --- 5. DATA OUTPUT DISPLAY ---
+    if "active_nut_plan" in st.session_state:
+        st.divider()
+        t1, t2 = st.tabs(["📋 Tactical Plan", "💰 Restock & Forecast"])
+        with t1:
+            st.markdown(st.session_state["active_nut_plan"])
+        with t2:
+            if "restock_list" in st.session_state:
+                st.markdown(st.session_state["restock_list"])
+            else:
+                st.info("Run 'Restock & Forecast' to see analysis.")
+
+    if "active_recon" in st.session_state:
+        st.success("Dining Recon Complete")
+        st.markdown(st.session_state["active_recon"])
+
+    # --- 6. MANUAL LOGGING ---
+    st.divider()
+    with st.expander("📝 Quick Calorie Log"):
+        # Create four columns to fit the Date input
+        c1, c2, c3, c4 = st.columns([2, 1, 1.5, 1])
+    
+        q_item = c1.text_input("Item", key="ql_i", placeholder="e.g. Protein Shake")
+        q_cal = c2.number_input("Kcal", value=0, step=50, key="ql_c")
+    
+        # Historical Date Selector
+        # Defaults to today, min_value pulls from account creation or a set past date
+        q_date = c3.date_input("Date", 
+                           value=datetime.date.today(),
+                           min_value=st.session_state.get("account_created", datetime.date(2024,1,1)),
+                           max_value=datetime.date.today(),
+                           key="ql_d")
+    
+        if c4.button("➕ Log", use_container_width=True):
+            if q_item and q_cal > 0:
+            # Pass the selected date to your saving function
+                save_entry("Nutrition", q_item, q_cal, q_date)
+                st.toast(f"Logged {q_item} for {q_date}")
+                st.rerun()
+            else:
+                st.error("Enter name and calories.")
+
+with tab_analysis:
+    st.header("📊 Tactical Analysis & Intelligence")
+
+    # --- SECTION 1: COMMAND SITREP ---
+    # Moved from the header to the top of Analysis
+    with st.container(border=True):
+        st.subheader("📡 Command Sitrep")
+        
+        # Global metrics pulled from session state
+        current_tier = st.session_state.get("current_tier", "Good Low")
+        bca_pass = st.session_state.get("bca_pass", True)
+        lockdown = st.session_state.get("mission_lockdown", False)
+        days_rem = (st.session_state.get("mission_deadline", datetime.date.today()) - datetime.date.today()).days
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Mission Proximity", f"{days_rem} Days")
+        col2.metric("PRT Status", current_tier)
+        col3.metric("BCA Standings", "PASS" if bca_pass else "FAIL")
+        col4.metric("Readiness Level", "STRIKE" if not lockdown else "RECOVERY", delta="LOCKDOWN" if lockdown else "NOMINAL", delta_color="inverse")
+
+    # --- SECTION 2: GENERATE INTELLIGENCE (AI AUDIT) ---
+    with st.container(border=True):
+        st.subheader("🕵️ Generate Intelligence")
+        st.write("Synthesize all mission logs, performance trends, and nutritional data into a tactical brief.")
+        
+        if st.button("🛰️ Initialize Tactical Audit", use_container_width=True, type="primary"):
+            with st.spinner("Analyzing data streams..."):
+                # Constructing the Intel Briefing
+                history_data = st.session_state.get("history", [])
+                recent_logs = history_data[-15:] if history_data else "No historical logs available."
+                
+                intel_p = f"""
+                ROLE: Navy Performance Intelligence Officer.
+                SITUATION: {days_rem} days to mission.
+                GOAL: {st.session_state.get('user_goal', 'PFA Excellence')}.
+                CURRENT STATUS: PRT {current_tier}, BCA {'Pass' if bca_pass else 'Fail'}.
+                SYSTEM STATE: {'LOCKDOWN' if lockdown else 'Optimal'}.
+                RECENT LOGS: {recent_logs}
+                
+                TASK: Generate a TACTICAL INTELLIGENCE BRIEF:
+                1. TREND ANALYSIS: Are metrics improving or stagnating?
+                2. LOGISTICAL GAP: Is current effort matching the mission goal?
+                3. IMMEDIATE ACTION: One shift in training or nutrition for the next 72 hours.
+                """
+                res = client.models.generate_content(model=MODEL_ID, contents=intel_p)
+                st.session_state["tactical_intel"] = res.text
+                st.rerun()
+
+        if "tactical_intel" in st.session_state:
+            st.markdown("---")
+            st.markdown(st.session_state["tactical_intel"])
+            if st.button("🗑️ Archive Intelligence"):
+                del st.session_state["tactical_intel"]
+                st.rerun()
+
+    # --- SECTION 3: VISUAL TREND ANALYSIS ---
+    with st.container(border=True):
+        st.subheader("📈 Performance Trajectory")
+        history_data = st.session_state.get("history", [])
+        
+        if history_data:
+            df = pd.DataFrame(history_data)
+            df['Date'] = pd.to_datetime(df['Date'])
+            
+            # Metabolic Output
+            st.write("**Metabolic Output Trends (Kcal)**")
+            workout_df = df[df['Category'] == 'Exercise']
+            if not workout_df.empty:
+                st.line_chart(workout_df.set_index('Date')['Value'])
+            
+            # Nutrition Trends
+            st.write("**Caloric Intake Consistency**")
+            nutri_df = df[df['Category'] == 'Nutrition']
+            if not nutri_df.empty:
+                st.area_chart(nutri_df.set_index('Date')['Value'])
+        else:
+            st.info("Awaiting mission data to populate trajectory charts.")
+
+    # --- SECTION 4: DATA MAINTENANCE ---
+    with st.expander("📂 Raw Log Access"):
+        if history_data:
+            st.table(pd.DataFrame(history_data).sort_values(by='Date', ascending=False))
+            if st.button("🗑️ Wipe Tactical History", type="secondary"):
+                st.session_state.history = []
+                st.rerun()
+        else:
+            st.write("Intelligence database is currently empty.")
