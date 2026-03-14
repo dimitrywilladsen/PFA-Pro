@@ -2,3 +2,10 @@ streamlit
 google-genai
 rapidfuzz
 streamlit-autorefresh
+garminconnect
+oura-ring
+pytz
+streamlit-js-eval
+python-docx
+openpyxl
+pandas
