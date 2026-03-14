@@ -16,22 +16,22 @@
 
 --------------------------------
 
-*# 💍 Oura API Compliance & Legal
+## 💍 Oura API Compliance & Legal
 
-### 📄 Privacy Policy & Data Usage
+# 📄 Privacy Policy & Data Usage
 This application (**PFA-Pro**) is a personal development project. 
 * **Data Collection:** We only access your Oura data (Sleep, Readiness, Activity) after you provide explicit consent via the Oura OAuth2 "Handshake."
 * **Data Storage:** Your data is processed locally within the Streamlit session. We do not sell, license, or lease your personal health data to any third parties, including advertisers or data brokers.
 * **Data Retention & Caching:** In accordance with the Oura API Agreement, **no Oura data is cached for longer than 60 days.** If a data point is removed from the Oura ecosystem, it is immediately purged from this application's session.
 * **User Rights:** You can revoke access at any time through [Oura on the Web](https://cloud.ouraring.com/profile). Revoking access will immediately stop any further data collection.
 
-### ⚖️ Terms of Service & Disclaimers
+# ⚖️ Terms of Service & Disclaimers
 * **Not Medical Advice:** The data provided by PFA-Pro is for informational purposes only. It is not a substitute for professional medical advice, diagnosis, or treatment. Always seek the advice of your physician.
 * **Liability Disclaimer:** To the maximum extent permitted by law, **Oura Health Oy and its affiliates shall not be liable** for any indirect, incidental, special, or consequential damages arising out of your use of this application.
 * **Non-Competition:** This application is an independent dashboard and does not replicate or compete with the primary Oura mobile experience.
 * **Support:** For support regarding this integration, please contact the developer via the GitHub issues page.
 
-### 🎨 Branding & Attribution
+# 🎨 Branding & Attribution
 * This application uses the Oura API but is not endorsed or certified by Oura.
 * **Attribution:** All biometric data is provided by Oura Health Oy. 
 * **Trademarks:** ŌURA, OURA, and the O logo are trademarks of Oura Health Oy. For more information, visit [ouraring.com](https://ouraring.com).
