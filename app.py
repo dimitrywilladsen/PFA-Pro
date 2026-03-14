@@ -215,13 +215,40 @@ def load_data():
             return pd.DataFrame(columns=['date', 'type', 'description', 'calories'])
     return pd.DataFrame(columns=['date', 'type', 'description', 'calories'])
 
-def save_entry(entry_type, desc, cals, target_date=None):
+def save_entry(category, activity, value, date_obj=None):
+    """The ONE function to rule them all. Handles HUD, CSV, and Burn logic."""
+    # 1. Default to today if no date is provided
+    if date_obj is None:
+        date_obj = datetime.date.today()
+    
+    # 2. Type Enforcement & Safety Clamping
+    try:
+        clean_value = float(value)
+    except (ValueError, TypeError):
+        return st.error(f"Invalid numeric value: {value}")
+    
+    safe_value = max(0.0, min(clean_value, 5000.0))
+    
+    # 3. Handle 'Burn' math (CSV needs negative numbers for Exercise/Passive)
+    # This keeps your old spreadsheet math consistent!
+    csv_value = -abs(safe_value) if category in ["Exercise", "Passive", "Active"] else abs(safe_value)
+
+    # 4. Save to Session State (for the Live HUD)
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    
+    st.session_state.history.append({
+        "Date": date_obj,
+        "Category": category,
+        "Activity": str(activity),
+        "Value": safe_value # HUD likes positive numbers
+    })
+
+    # 5. Save to CSV (The 'Permanent' log)
     file_exists = os.path.exists('fitness_log.csv')
-    adjusted_cals = -abs(cals) if entry_type in ["Exercise", "Passive"] else abs(cals)
-    log_date = str(target_date) if target_date else str(datetime.date.today())
-    new_data = pd.DataFrame([[log_date, entry_type, desc, adjusted_cals]], 
+    new_row = pd.DataFrame([[str(date_obj), category, activity, csv_value]], 
                             columns=['date', 'type', 'description', 'calories'])
-    new_data.to_csv('fitness_log.csv', mode='a', header=not file_exists, index=False)
+    new_row.to_csv('fitness_log.csv', mode='a', header=not file_exists, index=False)
 
 def load_pantry():
     if os.path.exists('pantry.csv'):
@@ -266,29 +293,6 @@ def global_safeguard():
 
 # Execute immediately
 global_safeguard()
-
-def save_entry(category, activity, value, date_obj):
-    # 1. Type Enforcement
-    try:
-        clean_value = float(value)
-    except (ValueError, TypeError):
-        return st.error("Invalid numeric value.")
-
-    # 2. Strategic Clamping (No 100,000 calorie 'typo' entries)
-    safe_value = max(0.0, min(clean_value, 5000.0))
-    
-    # 3. String Sanitization
-    safe_activity = str(activity)[:50].strip() or "Unnamed Entry"
-
-    if "history" not in st.session_state:
-        st.session_state.history = []
-
-    st.session_state.history.append({
-        "Date": date_obj,
-        "Category": category,
-        "Activity": safe_activity,
-        "Value": safe_value
-    })
 
 @st.dialog("Confirm Deletion")
 def confirm_delete_dialog(indices):
