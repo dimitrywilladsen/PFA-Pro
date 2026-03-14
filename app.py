@@ -4,7 +4,11 @@ import datetime
 import os
 import re
 import json
+from streamlit_autorefresh import st_autorefresh 
 from rapidfuzz import process, utils
+
+# Refresh the app every 30 seconds to update the "Live" tally
+st_autorefresh(interval=30000, key="daterefresh")
 
 # --- THE MASTER SYNC LOGIC ---
 def sync_mission_deadline():
@@ -26,13 +30,24 @@ standard_facilities = [
 
 # --- 2. GLOBAL STATE INITIALIZATION ---
 if "bmr" not in st.session_state:
-    st.session_state["bmr"] = 2000.0  
-    st.session_state["setup_complete"] = False
+    # 1. Physical Specs (Default values)
     st.session_state["gender"] = "Male"
     st.session_state["age"] = 25
-    st.session_state["height"] = 70.0
-    st.session_state["current_weight"] = 190.0
+    st.session_state["height_in"] = 70.0    # Set to your height in inches
+    st.session_state["weight_lbs"] = 190.0 # Set to your weight in lbs
+    st.session_state["setup_complete"] = False
     st.session_state["mission_lockdown"] = False
+
+    # 2. Conversion & Calculation
+    w_kg = st.session_state["weight_lbs"] * 0.453592
+    h_cm = st.session_state["height_in"] * 2.54
+    a = st.session_state["age"]
+
+    # 3. Setting the REAL BMR (No more 2000 default!)
+    if st.session_state["gender"] == "Male":
+        st.session_state["bmr"] = (10 * w_kg) + (6.25 * h_cm) - (5 * a) + 5
+    else:
+        st.session_state["bmr"] = (10 * w_kg) + (6.25 * h_cm) - (5 * a) - 161
 
 if "req_deficit" not in st.session_state:
     st.session_state["req_deficit"] = 500.0
@@ -53,6 +68,26 @@ bmr = st.session_state["bmr"]
 req_deficit = st.session_state["req_deficit"]
 burned_exercise = st.session_state["burned_exercise"]
 eaten = st.session_state["eaten"]
+
+# --- THE LIVE HUD MATH ---
+# 1. Get the current time and calculate how much of the day has passed
+now = datetime.datetime.now()
+seconds_since_midnight = (now.hour * 3600) + (now.minute * 60) + now.second
+percent_of_day = seconds_since_midnight / 86400
+
+# 2. Calculate the "Passive Burn" based on the current time
+# (e.g., if it's noon, you've burned 50% of your BMR)
+live_bmr = int(bmr * percent_of_day)
+
+# 3. Sum up today's "Active" entries from your history
+active_today = 0
+if "history" in st.session_state:
+    today_date = datetime.date.today()
+    active_today = sum(e["Value"] for e in st.session_state.history 
+                       if e["Date"] == today_date and e["Category"] == "Active")
+
+# 4. Final Live Total
+total_live_burn = live_bmr + active_today
 
 # --- GLOBAL CONFIGURATION ---
 MODEL_ID = "gemini-2.5-flash"
@@ -325,6 +360,50 @@ with st.sidebar:
                 os.remove("gym_data.csv")
                 st.rerun()
 
+# --- 4-COLUMN TACTICAL HUD ---
+st.subheader("⚓ Real-Time Mission Energy Status")
+
+# Create 4 columns for the full breakdown
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        label="🧘 Passive Burn", 
+        value=f"{live_bmr} kcal", 
+        help="Estimated calories burned by your body so far today (BMR)."
+    )
+
+with col2:
+    st.metric(
+        label="🏃 Active Burn", 
+        value=f"{active_today} kcal", 
+        help="Sum of all exercise/active entries logged today."
+    )
+
+with col3:
+    st.metric(
+        label="🍽️ Consumption", 
+        value=f"{int(eaten)} kcal", 
+        help="Total calories consumed today."
+    )
+
+with col4:
+    # Calculation: What you've eaten vs. what you've burned (Passive + Active)
+    # Negative = Deficit (Weight Loss), Positive = Surplus (Weight Gain)
+    current_balance = eaten - (live_bmr + active_today)
+    
+    # Logic to change the label based on the state
+    status_label = "📈 Surplus" if current_balance > 0 else "📉 Deficit"
+    
+    st.metric(
+        label=status_label, 
+        value=f"{int(abs(current_balance))} kcal",
+        delta=f"{int(current_balance)} vs Burn",
+        delta_color="inverse" # Red for surplus, Green for deficit
+    )
+
+st.divider()
+
 # --- 4. THE ENGINE ---
 logs = load_data()
 today_date = datetime.date.today()
@@ -356,48 +435,6 @@ if 'last_workout' not in st.session_state: st.session_state['last_workout'] = No
 if 'meal_desc_fill' not in st.session_state: st.session_state['meal_desc_fill'] = ""
 if 'meal_cal_fill' not in st.session_state: st.session_state['meal_cal_fill'] = 0
 
-# --- 5. MAIN DASHBOARD ---
-st.title("⚓ Navy PFA Mission Control")
-
-# --- PLACE THIS AT THE TOP OF YOUR MAIN PAGE (BEFORE TABS) ---
-
-with st.container(border=True):
-    # Calculation Logic
-    history = st.session_state.get("history", [])
-    
-    # 1. Passive Burn (BMR/RMR)
-    passive_burn = st.session_state.get("bmr", 1506) 
-    
-    # 2. Active Burn (Exercise logs)
-    active_burn = sum(item['Value'] for item in history if item['Category'] == 'Exercise')
-    
-    # 3. Calories Consumed (Nutrition logs)
-    calories_in = sum(item['Value'] for item in history if item['Category'] == 'Nutrition')
-    
-    # 4. Total Expenditure vs Consumption
-    total_out = passive_burn + active_burn
-    net_balance = calories_in - total_out
-
-    # Layout: 4 Columns to fill the horizontal space
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric("🕰️ Passive Burn", f"{passive_burn} kcal")
-    m2.metric("🏃 Active Burn", f"{active_burn} kcal")
-    m3.metric("🍎 Consumed", f"{calories_in} kcal")
-    
-    # Net Balance Logic
-    if net_balance < 0:
-        balance_label = f"Deficit: {abs(net_balance)} kcal"
-        delta_val = "- Deficit"
-        d_color = "normal" # Green in Streamlit
-    else:
-        balance_label = f"Surplus: {net_balance} kcal"
-        delta_val = "+ Surplus"
-        d_color = "inverse" # Red in Streamlit
-
-    m4.metric("⚖️ Net Balance", f"{net_balance} kcal", delta=delta_val, delta_color=d_color)
-
-st.divider()
 # --- 6. TABS ---
 tab_prt, tab_perf, tab_nut, tab_analysis = st.tabs(["🏆 PRT", "🏃 Performance", "🍽️ Nutrition", "📊 Analysis"])
 
