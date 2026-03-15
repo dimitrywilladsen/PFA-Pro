@@ -810,9 +810,18 @@ with st.sidebar:
     if gear_source == "Garmin Connect":
         st.markdown("### ⚓ GARMIN SMART SYNC")
         
-        u_email = st.text_input("Garmin Email", value=st.secrets.get("garmin", {}).get("email", ""))
-        u_pass = st.text_input("Garmin Password", type="password", value=st.secrets.get("garmin", {}).get("password", ""))
-        
+        # 1. Local Mode (Secrets Exist)
+        if "garmin" in st.secrets:
+            st.success("✅ Secure Vault credentials loaded.")
+            u_email = st.secrets["garmin"]["email"]
+            u_pass = st.secrets["garmin"]["password"]
+            
+        # 2. Cloud/Guest Mode (No Secrets)
+        else:
+            st.info("Guest Mode: Enter your Garmin credentials to sync.")
+            u_email = st.text_input("Garmin Email", key="guest_g_user")
+            u_pass = st.text_input("Garmin Password", type="password", key="guest_g_pass")
+            
         if st.button("📡 Execute Tactical Sync", use_container_width=True, type="primary"):
             if not u_email or not u_pass:
                 st.error("Credentials Required.")
@@ -823,7 +832,7 @@ with st.sidebar:
                         if count > 0:
                             st.success(f"✅ {s_type}: {count} days ingested.")
                             # This updates the 'Active Burn' metric for the HUD immediately
-                            st.session_state["sync_active_burn"] = count # Placeholder to trigger refresh
+                            st.session_state["sync_active_burn"] = count 
                         else:
                             st.info("💡 All systems synchronized. No new data found.")
                         st.rerun()
@@ -832,18 +841,32 @@ with st.sidebar:
 
     elif gear_source == "Oura Ring":
         st.markdown("### 💍 OURA LINK")
-        sys_token = st.secrets.get("oura", {}).get("token")
-        u_token = st.text_input("Manual Token Override", type="password", key="oura_man_token_final")
-        active_token = u_token.strip() if u_token.strip() else sys_token
+        
+        # 1. Local Mode (Secrets Exist)
+        if "oura" in st.secrets:
+            st.success("✅ Secure Vault token loaded.")
+            active_token = st.secrets["oura"]["token"]
+            
+        # 2. Cloud/Guest Mode (No Secrets)
+        else:
+            st.info("Guest Mode: Enter your Oura Personal Access Token.")
+            active_token = st.text_input("Manual Token Override", type="password", key="oura_man_token_final")
+            
         if st.button("🔄 Sync Oura", use_container_width=True, type="primary"):
-            if active_token:
-                res = fetch_oura_v2_data(active_token)
-                # SAVE THE ENTIRE RESULT OBJECT
-                st.session_state["oura_results"] = res 
-                # ALSO SAVE THE BURN SPECIFICALLY FOR THE TRACKER
-                st.session_state["oura_active_burn"] = res.get("active_cals", 0)
-                st.success("Successfully Synced!")
-                st.rerun()
+            if not active_token:
+                st.error("Token Required.")
+            else:
+                with st.spinner("Uplinking Oura telemetry..."):
+                    try:
+                        res = fetch_oura_v2_data(active_token)
+                        # SAVE THE ENTIRE RESULT OBJECT
+                        st.session_state["oura_results"] = res 
+                        # ALSO SAVE THE BURN SPECIFICALLY FOR THE TRACKER
+                        st.session_state["oura_active_burn"] = res.get("active_cals", 0)
+                        st.success("Successfully Synced!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Sync Error: {e}")
 
     elif gear_source in ["Fitbit", "Strava", "Whoop", "Suunto"]:
         st.info(f"Authorization for {gear_source} required.")
